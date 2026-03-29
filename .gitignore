@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# Quantized model output directories
+*-NVFP4/
+*-NVFP4-W4A16/
+
+# HuggingFace cache
+.cache/

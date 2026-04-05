@@ -3,7 +3,7 @@
 End-to-end walkthrough: quantize a model to NVFP4 and serve it with vLLM.
 
 **Hardware used:** NVIDIA RTX PRO 6000 Blackwell Workstation (SM 12.0, 96 GB VRAM)
-**Confirmed working:** vLLM 0.18.0, torch 2.10.0+cu128, llmcompressor (latest)
+**Confirmed working:** vLLM 0.19.0, torch 2.10.0+cu128, llmcompressor (git main)
 
 ---
 
@@ -41,18 +41,18 @@ sudo apt-get install -y python3.12-dev gcc
 
 ### Python environment
 
-```bash
-cd ~/code/models
+Dependencies are managed via `pyproject.toml`. The released llmcompressor (0.10.0.1)
+pins `transformers<=4.57.6` and crashes with `transformers>=5.x` due to a moved import
+(`TORCH_INIT_FUNCTIONS`). The fix exists on llm-compressor's `main` branch but is not
+yet released, so `pyproject.toml` installs llmcompressor from git main. The `[tool.uv]`
+section uses `override-dependencies` to force `transformers>=5.5.0` past llmcompressor's
+declared constraint.
 
-# Create a Python 3.12 virtual environment
+```bash
+# Create a Python 3.12 virtual environment and install all dependencies
 uv venv .venv --python 3.12
 source .venv/bin/activate
-
-# Install vLLM first (it brings its own compatible torch build)
-uv pip install vllm
-
-# Install llm-compressor (maintained under the vLLM project)
-uv pip install llmcompressor
+uv sync
 
 # Verify
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
@@ -62,7 +62,7 @@ python -c "import vllm; print(vllm.__version__)"
 Expected output:
 ```
 2.10.0+cu128 True
-0.18.0
+0.19.0
 ```
 
 ---
@@ -105,6 +105,21 @@ python quantize.py \
   --max-len 2048
 ```
 
+### Multimodal models (Gemma 4, etc.)
+
+Models with vision/audio components need those layers excluded from quantization.
+Use `--ignore` with regex patterns:
+
+```bash
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+python quantize.py \
+  --model google/gemma-4-31B-it \
+  --samples 512 \
+  --max-len 2048 \
+  --ignore lm_head "re:.*vision_tower.*" "re:.*audio_tower.*" "re:.*embed_vision.*" "re:.*embed_audio.*"
+```
+
 Expected output (0.5B model completes in under a minute):
 ```
 Done. Output size: 467 MB  (saved to ./Qwen2.5-0.5B-Instruct-NVFP4)
@@ -120,6 +135,10 @@ The original FP16 model is ~950 MB — roughly 2× smaller for W4A4.
 | `--samples` | `256` | Calibration samples (more = better accuracy) |
 | `--max-len` | `512` | Max tokens per calibration sample |
 | `--weight-only` | off | Use W4A16 instead of W4A4 |
+| `--ignore` | `lm_head` | Layer names/regex patterns to exclude (use `re:` prefix for regex) |
+| `--dtype` | `auto` | Model dtype: auto, bfloat16, float16 |
+| `--trust-remote-code` | off | Trust remote code when loading model/tokenizer |
+| `--dataset` | `HuggingFaceH4/ultrachat_200k` | HuggingFace dataset for calibration |
 
 ---
 

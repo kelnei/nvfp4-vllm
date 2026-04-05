@@ -1,0 +1,17 @@
+[project]
+name = "nvfp4-vllm"
+version = "0.1.0"
+description = "NVFP4 quantization and vLLM serving scripts"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "llmcompressor @ git+https://github.com/vllm-project/llm-compressor.git@main",
+    "transformers>=5.5.0",
+    "vllm==0.19.0",
+]
+
+[tool.uv]
+override-dependencies = [
+    "transformers>=5.5.0",
+    "compressed-tensors>=0.14.1a2",
+]

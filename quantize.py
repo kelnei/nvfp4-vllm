@@ -4,6 +4,8 @@ Quantize a model to NVFP4 (W4A4) using llm-compressor.
 Usage:
     python quantize.py [--model MODEL_ID] [--output OUTPUT_DIR]
                        [--samples N] [--max-len N] [--weight-only]
+                       [--ignore PATTERN ...] [--dtype TYPE]
+                       [--trust-remote-code] [--dataset DATASET]
 
 Defaults:
     model      = Qwen/Qwen2.5-0.5B-Instruct
@@ -11,6 +13,9 @@ Defaults:
     samples    = 256
     max-len    = 512
     weight-only = False (W4A4; set flag for W4A16)
+    ignore     = lm_head
+    dtype      = auto
+    dataset    = HuggingFaceH4/ultrachat_200k
 """
 
 import argparse
@@ -33,6 +38,15 @@ def parse_args():
                    help="Max token length per calibration sample")
     p.add_argument("--weight-only", action="store_true",
                    help="W4A16 (weights only, no calibration data needed)")
+    p.add_argument("--ignore", nargs="+", default=["lm_head"],
+                   help="Layer names/regex patterns to exclude from quantization "
+                        "(default: lm_head). Use re: prefix for regex patterns.")
+    p.add_argument("--dtype", default="auto",
+                   help="Model dtype: auto, bfloat16, float16 (default: auto)")
+    p.add_argument("--trust-remote-code", action="store_true",
+                   help="Trust remote code when loading model/tokenizer")
+    p.add_argument("--dataset", default="HuggingFaceH4/ultrachat_200k",
+                   help="HuggingFace dataset for calibration (default: HuggingFaceH4/ultrachat_200k)")
     return p.parse_args()
 
 
@@ -47,33 +61,55 @@ def main():
     print(f"Model:       {model_id}")
     print(f"Mode:        {'W4A16 (weight-only)' if args.weight_only else 'W4A4 (weights + activations)'}")
     print(f"Output dir:  {output_dir}")
+    print(f"Dtype:       {args.dtype}")
+    print(f"Ignore:      {args.ignore}")
     if not args.weight_only:
         print(f"Calibration: {args.samples} samples, max {args.max_len} tokens each")
+        print(f"Dataset:     {args.dataset}")
 
     print("\nLoading model...")
-    model = AutoModelForCausalLM.from_pretrained(model_id, dtype="auto", device_map="auto")
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    load_kwargs = dict(dtype=args.dtype, device_map="auto")
+    if args.trust_remote_code:
+        load_kwargs["trust_remote_code"] = True
+    model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id, trust_remote_code=args.trust_remote_code
+    )
 
     scheme = "NVFP4A16" if args.weight_only else "NVFP4"
-    recipe = QuantizationModifier(targets="Linear", scheme=scheme, ignore=["lm_head"])
+    recipe = QuantizationModifier(targets="Linear", scheme=scheme, ignore=args.ignore)
 
     if args.weight_only:
         print("Running weight-only quantization (no calibration data needed)...")
         oneshot(model=model, recipe=recipe)
     else:
-        print("Loading calibration dataset (HuggingFaceH4/ultrachat_200k)...")
-        ds = load_dataset(
-            "HuggingFaceH4/ultrachat_200k",
-            split=f"train_sft[:{args.samples}]",
-        )
+        print(f"Loading calibration dataset ({args.dataset})...")
+
+        # Determine the split name — ultrachat uses "train_sft", most others use "train"
+        if args.dataset == "HuggingFaceH4/ultrachat_200k":
+            split = f"train_sft[:{args.samples}]"
+        else:
+            split = f"train[:{args.samples}]"
+
+        ds = load_dataset(args.dataset, split=split)
         ds = ds.shuffle(seed=42)
 
         def preprocess(example):
-            return {
-                "text": tokenizer.apply_chat_template(
+            # Support datasets with "messages" (chat) or "text" (raw text) columns
+            if "messages" in example:
+                text = tokenizer.apply_chat_template(
                     example["messages"], tokenize=False
                 )
-            }
+            elif "text" in example:
+                text = example["text"]
+            elif "article" in example:
+                text = example["article"]
+            else:
+                # Fall back to first string column
+                text = next(
+                    v for v in example.values() if isinstance(v, str) and len(v) > 0
+                )
+            return {"text": text}
 
         def tokenize(sample):
             return tokenizer(

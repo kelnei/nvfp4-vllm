@@ -36,6 +36,8 @@ python chat.py
 | [`quantize.py`](quantize.py) | Quantize any HuggingFace model to NVFP4 (W4A4 or W4A16) |
 | [`serve.py`](serve.py) | Start an OpenAI-compatible vLLM server |
 | [`chat.py`](chat.py) | Interactive terminal chat client |
+| [`gemma4_moe.py`](gemma4_moe.py) | MoE linearization for llm-compressor (used by `quantize.py`) |
+| [`gemma4_vllm_patch.py`](gemma4_vllm_patch.py) | Runtime patch for vLLM's Gemma4 MoE NVFP4 weight loading (used by `serve.py`) |
 
 ## Options
 

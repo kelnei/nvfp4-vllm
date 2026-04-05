@@ -113,12 +113,25 @@ Use `--ignore` with regex patterns:
 ```bash
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+# Dense model (31B)
 python quantize.py \
   --model google/gemma-4-31B-it \
   --samples 512 \
   --max-len 2048 \
   --ignore lm_head "re:.*vision_tower.*" "re:.*audio_tower.*" "re:.*embed_vision.*" "re:.*embed_audio.*"
+
+# MoE model (26B-A4B)
+python quantize.py \
+  --model google/gemma-4-26B-A4B-it \
+  --samples 512 \
+  --max-len 2048 \
+  --ignore lm_head "re:.*vision_tower.*" "re:.*audio_tower.*" "re:.*embed_vision.*" "re:.*embed_audio.*" "re:.*router.*"
 ```
+
+**Gemma 4 MoE note:** `serve.py` automatically installs a runtime patch
+(`gemma4_vllm_patch.py`) that fixes vLLM's Gemma4 MoE weight loading for NVFP4
+checkpoints. The patch remaps per-expert weight names produced by llm-compressor's
+MoE linearization to the fused format vLLM expects. No manual steps needed.
 
 Expected output (0.5B model completes in under a minute):
 ```

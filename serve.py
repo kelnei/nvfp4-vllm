@@ -12,9 +12,29 @@ Defaults:
 
 import argparse
 import os
+import site
 import subprocess
 import sys
 from pathlib import Path
+
+
+def _install_pth_file():
+    """Install a .pth file so gemma4_vllm_patch is imported at Python startup.
+
+    vLLM spawns EngineCore in a separate process (multiprocessing spawn),
+    so monkey-patches applied in the parent don't carry over.  A .pth file
+    in site-packages runs at interpreter startup for every process, including
+    spawned children.  This is our file — uv sync won't touch it.
+    """
+    project_dir = str(Path(__file__).resolve().parent)
+    site_dir = site.getsitepackages()[0]
+    pth = Path(site_dir) / "nvfp4-gemma4-patch.pth"
+
+    # Two lines: first adds project dir to sys.path, second imports the patch
+    content = f"{project_dir}\nimport gemma4_vllm_patch\n"
+    if pth.exists() and pth.read_text() == content:
+        return
+    pth.write_text(content)
 
 
 def parse_args():
@@ -42,6 +62,8 @@ def main():
         print(f"Error: model path '{args.model}' does not exist.", file=sys.stderr)
         print("Run quantize.py first, or pass --model <path>.", file=sys.stderr)
         sys.exit(1)
+
+    _install_pth_file()
 
     cmd = [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",

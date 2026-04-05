@@ -11,6 +11,7 @@ Defaults:
 """
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -63,8 +64,13 @@ def main():
     print("Look for: 'Using NvFp4LinearBackend.VLLM_CUTLASS for NVFP4 GEMM'")
     print("Press Ctrl+C to stop.\n")
 
+    env = os.environ.copy()
+    # FlashInfer's CUTLASS FP4 backend requires JIT compilation (nvcc).
+    # Fall back to vLLM's built-in CUTLASS kernels if not explicitly set.
+    env.setdefault("VLLM_NVFP4_GEMM_BACKEND", "cutlass")
+
     try:
-        subprocess.run(cmd)
+        subprocess.run(cmd, env=env)
     except KeyboardInterrupt:
         print("\nServer stopped.")
 

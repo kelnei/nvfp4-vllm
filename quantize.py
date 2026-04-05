@@ -22,9 +22,12 @@ import argparse
 from pathlib import Path
 
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import QuantizationModifier
+
+# Register Gemma 4 MoE linearization so expert weights get quantized
+import gemma4_moe  # noqa: F401
 
 
 def parse_args():
@@ -135,6 +138,18 @@ def main():
     print(f"\nSaving quantized model to ./{output_dir} ...")
     model.save_pretrained(output_dir, save_compressed=True)
     tokenizer.save_pretrained(output_dir)
+
+    # Multimodal models (e.g. Gemma 4) need preprocessor_config.json for the
+    # vision/audio feature extractor. Save the processor if available.
+    try:
+        processor = AutoProcessor.from_pretrained(
+            model_id, trust_remote_code=args.trust_remote_code
+        )
+        processor.save_pretrained(output_dir)
+        if hasattr(processor, "image_processor"):
+            processor.image_processor.save_pretrained(output_dir)
+    except Exception:
+        pass
 
     size_mb = sum(
         f.stat().st_size for f in Path(output_dir).rglob("*") if f.is_file()

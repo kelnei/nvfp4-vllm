@@ -13,7 +13,7 @@ sudo apt-get install -y python3.12-dev gcc
 # Create virtual environment and install dependencies
 uv venv .venv --python 3.12
 source .venv/bin/activate
-uv pip install vllm llmcompressor
+uv sync
 ```
 
 ## Quickstart
@@ -50,6 +50,10 @@ python chat.py
 | `--samples` | `256` | Calibration samples (more = better accuracy) |
 | `--max-len` | `512` | Max tokens per calibration sample |
 | `--weight-only` | off | W4A16 mode (no calibration data needed) |
+| `--ignore` | `lm_head` | Layer names/regex patterns to exclude (use `re:` prefix for regex) |
+| `--dtype` | `auto` | Model dtype: auto, bfloat16, float16 |
+| `--trust-remote-code` | off | Trust remote code when loading model/tokenizer |
+| `--dataset` | `HuggingFaceH4/ultrachat_200k` | HuggingFace dataset for calibration |
 
 ### serve.py
 
@@ -66,6 +70,7 @@ python chat.py
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--url` | `http://localhost:8000/v1` | vLLM server URL |
+| `--model` | auto-detect | Model name (auto-detected from server if omitted) |
 | `--system` | `You are a helpful assistant.` | System prompt |
 | `--temperature` | `0.7` | Sampling temperature |
 | `--max-tokens` | `512` | Max tokens per response |

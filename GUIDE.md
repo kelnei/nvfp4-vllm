@@ -254,7 +254,7 @@ vllm serve nvidia/DeepSeek-R1-NVFP4             --quantization modelopt
 
 ---
 
-## 4. Accuracy vs. Speed Trade-offs
+## 5. Accuracy vs. Speed Trade-offs
 
 | Approach | Accuracy | Throughput | Notes |
 |----------|----------|------------|-------|
@@ -268,7 +268,7 @@ or `nvfp4_mlp_only` if quality matters.
 
 ---
 
-## 5. Known Gotchas
+## 6. Known Gotchas
 
 ### SM 12.0 (RTX Pro 6000 / RTX 5080 / RTX 6000 Pro)
 Desktop Blackwell cards are SM 12.0 vs the data-center B200 at SM 10.0. vLLM has
@@ -277,7 +277,7 @@ that NVFP4 kernels are loaded, not a fallback. Open issues in vllm-project/vllm:
 [#30707](https://github.com/vllm-project/vllm/issues/30707),
 [#31085](https://github.com/vllm-project/vllm/issues/31085).
 
-**Confirmed working on RTX PRO 6000 Blackwell (SM 12.0) with vLLM 0.18.0** — CUTLASS
+**Confirmed working on RTX PRO 6000 Blackwell (SM 12.0) with vLLM 0.19.0** — CUTLASS
 NVFP4 kernels load correctly with the `compressed-tensors` quantization path.
 
 ### Out of memory during quantization
@@ -300,7 +300,7 @@ Check logs for `NVFP4` kernel mentions to confirm.
 
 ---
 
-## 6. References
+## 7. References
 
 - [NVIDIA: Introducing NVFP4](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/)
 - [vLLM + llm-compressor NVFP4 docs](https://docs.vllm.ai/projects/llm-compressor/en/latest/examples/quantization_w4a4_fp4/)

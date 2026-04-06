@@ -165,12 +165,48 @@ python serve.py
 
 # Limit VRAM usage (useful for small models or when sharing the GPU):
 python serve.py --gpu-memory-utilization 0.3
+
+# Multi-GPU with tensor parallelism:
+python serve.py --tensor-parallel-size 2
+
+# FP8 KV cache for lower memory usage:
+python serve.py --kv-cache-dtype fp8
+
+# Enable tool/function calling (e.g. for Hermes-style models):
+python serve.py --tool-call-parser hermes --enable-auto-tool-choice
+
+# Speculative decoding:
+python serve.py --speculative-config '{"draft_model": "org/small-model", "num_speculative_tokens": 5}'
 ```
 
 By default vLLM reserves 90% of VRAM (~86 GB on this card) for the model and KV
 cache combined. For a 0.5B model the model itself is only ~0.5 GB — the rest is KV
 cache blocks pre-allocated to avoid fragmentation at runtime. Use
 `--gpu-memory-utilization` to cap it.
+
+### serve.py flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model` | `./Qwen2.5-0.5B-Instruct-NVFP4` | Path to quantized model |
+| `--host` | `0.0.0.0` | Bind address |
+| `--port` | `8000` | Server port |
+| `--served-model-name` | model path | Model name exposed in the API |
+| `--dtype` | `auto` | Model dtype: auto, bfloat16, float16, float32 |
+| `--seed` | none | Random seed for reproducibility |
+| `--trust-remote-code` | off | Trust remote code when loading model/tokenizer |
+| `--max-model-len` | `32768` | Maximum context length |
+| `--gpu-memory-utilization` | `0.90` | Fraction of VRAM reserved for model + KV cache |
+| `--tensor-parallel-size`, `-tp` | `1` | Number of GPUs for tensor parallelism |
+| `--pipeline-parallel-size`, `-pp` | `1` | Number of GPUs for pipeline parallelism |
+| `--max-num-seqs` | vLLM default | Max concurrent sequences (batch size) |
+| `--quantization` | auto | Force backend (e.g. `modelopt` for NVIDIA checkpoints) |
+| `--kv-cache-dtype` | `auto` | KV cache dtype: auto, fp8, fp8_e5m2, fp8_e4m3 |
+| `--enforce-eager` | off | Disable CUDA graph compilation (useful for debugging) |
+| `--enable-prefix-caching` | off | Enable KV cache reuse across requests with shared prefixes |
+| `--speculative-config` | none | JSON string or file path for speculative decoding config |
+| `--tool-call-parser` | none | Tool/function call parser (e.g. hermes, llama3_json, mistral) |
+| `--enable-auto-tool-choice` | off | Let the model decide when to use tools |
 
 ### Chat interactively
 

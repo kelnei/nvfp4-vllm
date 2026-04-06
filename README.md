@@ -60,10 +60,24 @@ python chat.py
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--model` | `./Qwen2.5-0.5B-Instruct-NVFP4` | Path to quantized model |
+| `--host` | `0.0.0.0` | Bind address |
 | `--port` | `8000` | Server port |
+| `--served-model-name` | model path | Model name exposed in the API |
+| `--dtype` | `auto` | Model dtype: auto, bfloat16, float16, float32 |
+| `--seed` | none | Random seed for reproducibility |
+| `--trust-remote-code` | off | Trust remote code when loading model/tokenizer |
 | `--max-model-len` | `32768` | Maximum context length |
 | `--gpu-memory-utilization` | `0.90` | Fraction of VRAM reserved for model + KV cache |
+| `--tensor-parallel-size` | `1` | Number of GPUs for tensor parallelism |
+| `--pipeline-parallel-size` | `1` | Number of GPUs for pipeline parallelism |
+| `--max-num-seqs` | vLLM default | Max concurrent sequences (batch size) |
 | `--quantization` | auto | Force backend (use `modelopt` for NVIDIA pre-quantized checkpoints) |
+| `--kv-cache-dtype` | `auto` | KV cache dtype: auto, fp8, fp8_e5m2, fp8_e4m3 |
+| `--enforce-eager` | off | Disable CUDA graph compilation (useful for debugging) |
+| `--enable-prefix-caching` | off | Enable KV cache reuse across requests with shared prefixes |
+| `--speculative-config` | none | JSON string or file path for speculative decoding config |
+| `--tool-call-parser` | none | Tool/function call parser (e.g. hermes, llama3_json, mistral) |
+| `--enable-auto-tool-choice` | off | Let the model decide when to use tools |
 
 ### chat.py
 

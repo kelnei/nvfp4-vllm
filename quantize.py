@@ -26,9 +26,6 @@ from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import QuantizationModifier
 
-# Register Gemma 4 MoE linearization so expert weights get quantized
-import gemma4_moe  # noqa: F401
-
 
 def parse_args():
     p = argparse.ArgumentParser()

@@ -1454,8 +1454,8 @@ wheels = [
 
 [[package]]
 name = "llmcompressor"
-version = "0.10.1.dev67+ga1cec6fa"
-source = { git = "https://github.com/vllm-project/llm-compressor.git?rev=main#a1cec6fa8687b387726b78e4c541b54ca6262066" }
+version = "0.10.1.dev97+gfe706bb7"
+source = { git = "https://github.com/vllm-project/llm-compressor.git?rev=main#fe706bb71f5fe4999fc4d385d97fd4a75e98546b" }
 dependencies = [
     { name = "accelerate" },
     { name = "auto-round" },

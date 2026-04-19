@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "WebSearch",
-      "WebFetch(domain:docs.vllm.ai)"
+      "WebFetch(domain:docs.vllm.ai)",
+      "Bash(uv pip *)",
+      "Bash(uv lock *)",
+      "Bash(uv sync *)",
+      "Bash(.venv/bin/python -c \"from llmcompressor import oneshot; print\\('OK'\\)\")"
     ]
   }
 }

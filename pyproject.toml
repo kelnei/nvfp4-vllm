@@ -13,5 +13,5 @@ dependencies = [
 [tool.uv]
 override-dependencies = [
     "transformers>=5.5.0",
-    "compressed-tensors>=0.14.1a2",
+    "compressed-tensors>=0.15.1a2",
 ]

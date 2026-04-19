@@ -11,7 +11,7 @@ resolution-markers = [
 
 [manifest]
 overrides = [
-    { name = "compressed-tensors", specifier = ">=0.14.1a2" },
+    { name = "compressed-tensors", specifier = ">=0.15.1a2" },
     { name = "transformers", specifier = ">=5.5.0" },
 ]
 
@@ -528,7 +528,7 @@ wheels = [
 
 [[package]]
 name = "compressed-tensors"
-version = "0.14.1a20260326"
+version = "0.15.1a20260416"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "loguru" },
@@ -536,9 +536,9 @@ dependencies = [
     { name = "torch" },
     { name = "transformers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/97/df/c3e07b8a0d338300d7e9615e101a5475a24230e2b710da86a797cec3bdee/compressed_tensors-0.14.1a20260326.tar.gz", hash = "sha256:4a2ccddea28d96877af282f494ff2f55bb5bbc2faf6bb359c23fac165ad5c203", size = 228327, upload-time = "2026-03-27T01:10:14.693Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ab/f2/cff622fb2cd2280f6bae3fe9a44e07876d65abf7f01ceb2ff7822a71556f/compressed_tensors-0.15.1a20260416.tar.gz", hash = "sha256:8191809ab1c44b9bbdc22a914c6c8133baefa7753a8a33b87508454759be5422", size = 249581, upload-time = "2026-04-17T01:30:43.398Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a7/9e/14bb460dfee88e38a6a6e51be0b40bca582ba2f8e66ea0c2d714d8747182/compressed_tensors-0.14.1a20260326-py3-none-any.whl", hash = "sha256:276c4517ab239d4bb75c0e98d515cb03b770dc191f19d5bdf9196d11cac5b08d", size = 192572, upload-time = "2026-03-27T01:10:12.071Z" },
+    { url = "https://files.pythonhosted.org/packages/de/fb/f37c3737dff72cdfb8b1c8e7c7c57b2ca4d99b921a0f519edcbeef3f9c86/compressed_tensors-0.15.1a20260416-py3-none-any.whl", hash = "sha256:4c3abc149cb5a4431e4f8e8e0bb12d4b16ec57f00038ae889be2cc52f741a512", size = 205904, upload-time = "2026-04-17T01:30:41.619Z" },
 ]
 
 [[package]]

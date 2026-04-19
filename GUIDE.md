@@ -147,6 +147,7 @@ The original FP16 model is ~950 MB — roughly 2× smaller for W4A4.
 | `--dtype` | `auto` | Model dtype: auto, bfloat16, float16 |
 | `--trust-remote-code` | off | Trust remote code when loading model/tokenizer |
 | `--dataset` | `HuggingFaceH4/ultrachat_200k` | HuggingFace dataset for calibration |
+| `--cpu-offload` | off | Load model to system RAM; llm-compressor dispatches layers to GPU during calibration (use for large MoE models) |
 
 ---
 

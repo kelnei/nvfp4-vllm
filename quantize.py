@@ -47,6 +47,10 @@ def parse_args():
                    help="Trust remote code when loading model/tokenizer")
     p.add_argument("--dataset", default="HuggingFaceH4/ultrachat_200k",
                    help="HuggingFace dataset for calibration (default: HuggingFaceH4/ultrachat_200k)")
+    p.add_argument("--cpu-offload", action="store_true",
+                   help="Load model to CPU/system RAM; llm-compressor dispatches "
+                        "layers to GPU during calibration. Use for large MoE models "
+                        "that don't fit alongside expert-unpacking overhead.")
     return p.parse_args()
 
 
@@ -68,7 +72,9 @@ def main():
         print(f"Dataset:     {args.dataset}")
 
     print("\nLoading model...")
-    load_kwargs = dict(dtype=args.dtype, device_map="auto")
+    load_kwargs = dict(dtype=args.dtype)
+    if not args.cpu_offload:
+        load_kwargs["device_map"] = "auto"
     if args.trust_remote_code:
         load_kwargs["trust_remote_code"] = True
     model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)

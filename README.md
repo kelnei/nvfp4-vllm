@@ -52,13 +52,14 @@ python chat.py
 | `--dtype` | `auto` | Model dtype: auto, bfloat16, float16 |
 | `--trust-remote-code` | off | Trust remote code when loading model/tokenizer |
 | `--dataset` | `HuggingFaceH4/ultrachat_200k` | HuggingFace dataset for calibration |
+| `--split` | auto | Dataset split (`train_sft` for ultrachat, `train` otherwise) |
 | `--cpu-offload` | off | Load model to system RAM; llm-compressor dispatches layers to GPU during calibration (use for large MoE models) |
 
 ### serve.py
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model` | `./Qwen2.5-0.5B-Instruct-NVFP4` | Path to quantized model |
+| `--model` | `./Qwen2.5-0.5B-Instruct-NVFP4` | Path to quantized model, or a HuggingFace model ID |
 | `--host` | `0.0.0.0` | Bind address |
 | `--port` | `8000` | Server port |
 | `--served-model-name` | model path | Model name exposed in the API |
@@ -72,11 +73,15 @@ python chat.py
 | `--max-num-seqs` | vLLM default | Max concurrent sequences (batch size) |
 | `--quantization` | auto | Force backend (use `modelopt` for NVIDIA pre-quantized checkpoints) |
 | `--kv-cache-dtype` | `auto` | KV cache dtype: auto, fp8, fp8_e5m2, fp8_e4m3 |
+| `--linear-backend` | `cutlass` | GEMM kernel backend; `auto` lets vLLM pick but may need nvcc for FlashInfer JIT |
 | `--enforce-eager` | off | Disable CUDA graph compilation (useful for debugging) |
 | `--enable-prefix-caching` | off | Enable KV cache reuse across requests with shared prefixes |
 | `--speculative-config` | none | JSON string or file path for speculative decoding config |
 | `--tool-call-parser` | none | Tool/function call parser (e.g. hermes, llama3_json, mistral) |
 | `--enable-auto-tool-choice` | off | Let the model decide when to use tools |
+
+Any flag not listed above is passed through to vLLM unchanged, so every
+`vllm serve` option is available (e.g. `--swap-space 8`).
 
 ### chat.py
 
@@ -88,14 +93,16 @@ python chat.py
 | `--temperature` | `0.7` | Sampling temperature |
 | `--max-tokens` | `512` | Max tokens per response |
 
-Chat commands: `/clear` resets history, `/system` prints the system prompt, `/quit` exits.
+Chat commands: `/clear` resets history, `/system` prints the system prompt
+(`/system <text>` sets a new one), `/quit` exits.
 
 ## Notes
 
 - vLLM pre-allocates KV cache up to `--gpu-memory-utilization` of VRAM. On a 96 GB card
   with a small model, pass `--gpu-memory-utilization 0.3` to avoid reserving unused memory.
 - Confirm NVFP4 kernels are active by checking vLLM logs for:
-  `Using NvFp4LinearBackend.VLLM_CUTLASS for NVFP4 GEMM`
+  `Using CutlassNvFp4LinearKernel for NVFP4 GEMM` (a warning about the
+  emulation backend means the optimized kernels did not load)
 - Pre-quantized NVIDIA checkpoints are available on HuggingFace (e.g.
   `nvidia/Llama-3.3-70B-Instruct-FP4`) and can be served directly with
   `python serve.py --model nvidia/Llama-3.3-70B-Instruct-FP4 --quantization modelopt`

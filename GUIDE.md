@@ -3,7 +3,7 @@
 End-to-end walkthrough: quantize a model to NVFP4 and serve it with vLLM.
 
 **Hardware used:** NVIDIA RTX PRO 6000 Blackwell Workstation (SM 12.0, 96 GB VRAM)
-**Confirmed working:** vLLM 0.19.0, torch 2.10.0+cu128, llmcompressor (git main)
+**Confirmed working:** vLLM 0.25.1, torch 2.11.0+cu130, llmcompressor 0.12.0
 
 ---
 
@@ -41,12 +41,11 @@ sudo apt-get install -y python3.12-dev gcc
 
 ### Python environment
 
-Dependencies are managed via `pyproject.toml`. The released llmcompressor (0.10.0.1)
-pins `transformers<=4.57.6` and crashes with `transformers>=5.x` due to a moved import
-(`TORCH_INIT_FUNCTIONS`). The fix exists on llm-compressor's `main` branch but is not
-yet released, so `pyproject.toml` installs llmcompressor from git main. The `[tool.uv]`
-section uses `override-dependencies` to force `transformers>=5.5.0` past llmcompressor's
-declared constraint.
+Dependencies are managed via `pyproject.toml` with exact pins for the core stack
+(vLLM 0.25.1, llmcompressor 0.12.0, transformers 5.10.1). One quirk: vLLM 0.25.1
+pins `compressed-tensors==0.17.0` while llmcompressor 0.12.0 pins `==0.17.1`, so the
+`[tool.uv]` section uses `override-dependencies` to force the newer patch release —
+without it the two packages cannot resolve together.
 
 ```bash
 # Create a Python 3.12 virtual environment and install all dependencies
@@ -61,8 +60,8 @@ python -c "import vllm; print(vllm.__version__)"
 
 Expected output:
 ```
-2.10.0+cu128 True
-0.19.0
+2.11.0+cu130 True
+0.25.1
 ```
 
 ---
@@ -147,6 +146,7 @@ The original FP16 model is ~950 MB — roughly 2× smaller for W4A4.
 | `--dtype` | `auto` | Model dtype: auto, bfloat16, float16 |
 | `--trust-remote-code` | off | Trust remote code when loading model/tokenizer |
 | `--dataset` | `HuggingFaceH4/ultrachat_200k` | HuggingFace dataset for calibration |
+| `--split` | auto | Dataset split (`train_sft` for ultrachat, `train` otherwise) |
 | `--cpu-offload` | off | Load model to system RAM; llm-compressor dispatches layers to GPU during calibration (use for large MoE models) |
 
 ---
@@ -184,7 +184,7 @@ cache blocks pre-allocated to avoid fragmentation at runtime. Use
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model` | `./Qwen2.5-0.5B-Instruct-NVFP4` | Path to quantized model |
+| `--model` | `./Qwen2.5-0.5B-Instruct-NVFP4` | Path to quantized model, or a HuggingFace model ID |
 | `--host` | `0.0.0.0` | Bind address |
 | `--port` | `8000` | Server port |
 | `--served-model-name` | model path | Model name exposed in the API |
@@ -198,11 +198,15 @@ cache blocks pre-allocated to avoid fragmentation at runtime. Use
 | `--max-num-seqs` | vLLM default | Max concurrent sequences (batch size) |
 | `--quantization` | auto | Force backend (e.g. `modelopt` for NVIDIA checkpoints) |
 | `--kv-cache-dtype` | `auto` | KV cache dtype: auto, fp8, fp8_e5m2, fp8_e4m3 |
+| `--linear-backend` | `cutlass` | GEMM kernel backend; `auto` lets vLLM pick but may need nvcc for FlashInfer JIT |
 | `--enforce-eager` | off | Disable CUDA graph compilation (useful for debugging) |
 | `--enable-prefix-caching` | off | Enable KV cache reuse across requests with shared prefixes |
 | `--speculative-config` | none | JSON string or file path for speculative decoding config |
 | `--tool-call-parser` | none | Tool/function call parser (e.g. hermes, llama3_json, mistral) |
 | `--enable-auto-tool-choice` | off | Let the model decide when to use tools |
+
+Any flag not listed above is passed through to vLLM unchanged, so every
+`vllm serve` option is available (e.g. `--swap-space 8`).
 
 ### Chat interactively
 
@@ -228,8 +232,10 @@ automatically — no `--quantization` flag needed.
 To confirm NVFP4 kernels are actually active (not silently falling back), look for
 this line in the vLLM startup logs:
 ```
-Using NvFp4LinearBackend.VLLM_CUTLASS for NVFP4 GEMM
+Using CutlassNvFp4LinearKernel for NVFP4 GEMM
 ```
+A warning about the "emulation backend" means no optimized kernel loaded — the
+model will run but without the FP4 speedup.
 
 ### CLI
 
@@ -309,7 +315,7 @@ that NVFP4 kernels are loaded, not a fallback. Open issues in vllm-project/vllm:
 [#30707](https://github.com/vllm-project/vllm/issues/30707),
 [#31085](https://github.com/vllm-project/vllm/issues/31085).
 
-**Confirmed working on RTX PRO 6000 Blackwell (SM 12.0) with vLLM 0.19.0** — CUTLASS
+**Confirmed working on RTX PRO 6000 Blackwell (SM 12.0) with vLLM 0.25.1** — CUTLASS
 NVFP4 kernels load correctly with the `compressed-tensors` quantization path.
 
 ### Out of memory during quantization
@@ -319,11 +325,17 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 python quantize.py --model <large-model> ...
 ```
 
-### FlashInfer conflicts
-If vLLM crashes on startup, try:
-```bash
-pip uninstall flashinfer-python
+### FlashInfer JIT needs nvcc
+With `--linear-backend auto`, vLLM may auto-select a FlashInfer NVFP4 kernel that
+JIT-compiles CUDA code at startup. Without the CUDA toolkit installed, the engine
+dies with:
 ```
+RuntimeError: Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist
+```
+The same applies to vLLM's default top-k/top-p sampler, which also comes from
+FlashInfer. `serve.py` handles both: it defaults to `--linear-backend cutlass`
+(vLLM's built-in kernels, no JIT) and sets `VLLM_USE_FLASHINFER_SAMPLER=0` when
+nvcc is not found. Install the CUDA toolkit if you want the FlashInfer backends.
 
 ### Silent fallback kills performance
 A misconfigured model can run in dequantization mode (loads weights as FP4,

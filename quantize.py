@@ -5,7 +5,7 @@ Usage:
     python quantize.py [--model MODEL_ID] [--output OUTPUT_DIR]
                        [--samples N] [--max-len N] [--weight-only]
                        [--ignore PATTERN ...] [--dtype TYPE]
-                       [--trust-remote-code] [--dataset DATASET]
+                       [--trust-remote-code] [--dataset DATASET] [--split SPLIT]
 
 Defaults:
     model      = Qwen/Qwen2.5-0.5B-Instruct
@@ -16,13 +16,19 @@ Defaults:
     ignore     = lm_head
     dtype      = auto
     dataset    = HuggingFaceH4/ultrachat_200k
+    split      = auto (train_sft for ultrachat, train otherwise)
 """
 
 import argparse
 from pathlib import Path
 
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoProcessor,
+    AutoTokenizer,
+    PreTrainedTokenizerBase,
+)
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import QuantizationModifier
 
@@ -47,6 +53,9 @@ def parse_args():
                    help="Trust remote code when loading model/tokenizer")
     p.add_argument("--dataset", default="HuggingFaceH4/ultrachat_200k",
                    help="HuggingFace dataset for calibration (default: HuggingFaceH4/ultrachat_200k)")
+    p.add_argument("--split", default=None,
+                   help="Dataset split for calibration (default: train_sft for "
+                        "ultrachat_200k, train otherwise)")
     p.add_argument("--cpu-offload", action="store_true",
                    help="Load model to CPU/system RAM; llm-compressor dispatches "
                         "layers to GPU during calibration. Use for large MoE models "
@@ -91,13 +100,12 @@ def main():
     else:
         print(f"Loading calibration dataset ({args.dataset})...")
 
-        # Determine the split name — ultrachat uses "train_sft", most others use "train"
-        if args.dataset == "HuggingFaceH4/ultrachat_200k":
-            split = f"train_sft[:{args.samples}]"
-        else:
-            split = f"train[:{args.samples}]"
+        # ultrachat names its split "train_sft"; most datasets use "train"
+        split = args.split or (
+            "train_sft" if args.dataset == "HuggingFaceH4/ultrachat_200k" else "train"
+        )
 
-        ds = load_dataset(args.dataset, split=split)
+        ds = load_dataset(args.dataset, split=f"{split}[:{args.samples}]")
         ds = ds.shuffle(seed=42)
 
         def preprocess(example):
@@ -143,16 +151,19 @@ def main():
     tokenizer.save_pretrained(output_dir)
 
     # Multimodal models (e.g. Gemma 4) need preprocessor_config.json for the
-    # vision/audio feature extractor. Save the processor if available.
+    # vision/audio feature extractor. Save the processor if there is one
+    # (for text-only models AutoProcessor just returns the tokenizer again).
     try:
         processor = AutoProcessor.from_pretrained(
             model_id, trust_remote_code=args.trust_remote_code
         )
+    except Exception:
+        processor = None
+    if processor is not None and not isinstance(processor, PreTrainedTokenizerBase):
         processor.save_pretrained(output_dir)
         if hasattr(processor, "image_processor"):
             processor.image_processor.save_pretrained(output_dir)
-    except Exception:
-        pass
+        print("Saved processor config (multimodal model)")
 
     size_mb = sum(
         f.stat().st_size for f in Path(output_dir).rglob("*") if f.is_file()

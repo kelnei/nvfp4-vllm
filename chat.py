@@ -12,9 +12,10 @@ Defaults:
     max-tokens  = 512
 
 Commands during chat:
-    /clear    - clear conversation history
-    /system   - print current system prompt
-    /quit     - exit (also Ctrl+C or Ctrl+D)
+    /clear           - clear conversation history
+    /system          - print current system prompt
+    /system <text>   - set a new system prompt
+    /quit            - exit (also Ctrl+C or Ctrl+D)
 """
 
 import argparse
@@ -96,8 +97,10 @@ def main():
 
     print(f"Connected to {args.url}")
     print(f"Model: {model}")
-    print(f"Type /clear to reset history, /quit to exit.\n")
+    print("Type /clear to reset history, /system to view/set the system prompt, "
+          "/quit to exit.\n")
 
+    system_prompt = args.system
     history = []
 
     while True:
@@ -117,13 +120,18 @@ def main():
             history = []
             print("[History cleared]\n")
             continue
-        elif user_input == "/system":
-            print(f"[System: {args.system}]\n")
+        elif user_input.startswith("/system"):
+            new_prompt = user_input[len("/system"):].strip()
+            if new_prompt:
+                system_prompt = new_prompt
+                print(f"[System prompt updated: {system_prompt}]\n")
+            else:
+                print(f"[System: {system_prompt}]\n")
             continue
 
         history.append({"role": "user", "content": user_input})
 
-        messages = [{"role": "system", "content": args.system}] + history
+        messages = [{"role": "system", "content": system_prompt}] + history
 
         print("Assistant: ", end="", flush=True)
         try:

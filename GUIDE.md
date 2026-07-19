@@ -201,8 +201,9 @@ python serve.py --tensor-parallel-size 2
 # FP8 KV cache for lower memory usage:
 python serve.py --kv-cache-dtype fp8
 
-# Enable tool/function calling (e.g. for Hermes-style models):
-python serve.py --tool-call-parser hermes --enable-auto-tool-choice
+# Enable tool/function calling (parser must match the model family,
+# e.g. gemma4 for Gemma 4 checkpoints, hermes for Hermes-style models):
+python serve.py --tool-call-parser gemma4 --enable-auto-tool-choice
 
 # Speculative decoding:
 python serve.py --speculative-config '{"draft_model": "org/small-model", "num_speculative_tokens": 5}'
@@ -255,6 +256,32 @@ python chat.py --system "You are a concise assistant." --temperature 0.5
 
 Commands inside chat: `/clear` resets history, `/system` prints the system prompt,
 `/quit` exits.
+
+### Tool calling
+
+`chat.py --tools` offers the model a built-in `web_fetch` tool (fetches a URL
+and returns the page's visible text, stdlib only). When the model requests a
+tool, chat.py prints `[tool] web_fetch({...})`, runs it locally, feeds the
+result back, and lets the model continue — up to 5 tool rounds per turn.
+
+The server must be started with a tool parser matching the model family:
+
+```bash
+python serve.py --model ./gemma-4-26B-A4B-it-NVFP4 --trust-remote-code \
+  --tool-call-parser gemma4 --enable-auto-tool-choice
+```
+
+```
+You: Fetch https://example.com and tell me in one sentence what the page says.
+Assistant:
+[tool] web_fetch({"url": "https://example.com"})
+Assistant: The page states that Example Domain is a domain intended for use in
+documentation examples without needing permission.
+```
+
+Adding your own tool is three steps in chat.py: append an OpenAI-format spec
+to `TOOL_SPECS`, add the implementation to `TOOL_IMPLS`, done — the loop
+handles the rest.
 
 ---
 

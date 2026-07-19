@@ -103,10 +103,13 @@ def main():
     args, extra_vllm_args = parse_args()
 
     # Anything not path-like is assumed to be a HuggingFace model ID.
-    if args.model.startswith((".", "/", "~")) and not Path(args.model).exists():
-        print(f"Error: model path '{args.model}' does not exist.", file=sys.stderr)
-        print("Run quantize.py first, or pass --model <path-or-HF-id>.", file=sys.stderr)
-        sys.exit(1)
+    if args.model.startswith((".", "/", "~")):
+        model_path = Path(args.model).expanduser()
+        if not model_path.exists():
+            print(f"Error: model path '{args.model}' does not exist.", file=sys.stderr)
+            print("Run quantize.py first, or pass --model <path-or-HF-id>.", file=sys.stderr)
+            sys.exit(1)
+        args.model = str(model_path)
 
     env = os.environ.copy()
     linear_backend = args.linear_backend

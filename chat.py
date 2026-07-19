@@ -120,7 +120,7 @@ def main():
             history = []
             print("[History cleared]\n")
             continue
-        elif user_input.startswith("/system"):
+        elif user_input == "/system" or user_input.startswith("/system "):
             new_prompt = user_input[len("/system"):].strip()
             if new_prompt:
                 system_prompt = new_prompt

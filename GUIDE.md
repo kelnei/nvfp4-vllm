@@ -232,6 +232,7 @@ cache blocks pre-allocated to avoid fragmentation at runtime. Use
 | `--quantization` | auto | Force backend (e.g. `modelopt` for NVIDIA checkpoints) |
 | `--kv-cache-dtype` | `auto` | KV cache dtype: auto, fp8, fp8_e5m2, fp8_e4m3 |
 | `--linear-backend` | auto (`cutlass` if nvcc missing) | Force the GEMM kernel backend (e.g. `cutlass`, `marlin`, `flashinfer_cutlass`) |
+| `--moe-backend` | auto (`cutlass` if nvcc missing) | Force the fused-MoE kernel backend (e.g. `cutlass`, `marlin`, `flashinfer_cutlass`) |
 | `--enforce-eager` | off | Disable CUDA graph compilation (useful for debugging) |
 | `--enable-prefix-caching` | off | Enable KV cache reuse across requests with shared prefixes |
 | `--speculative-config` | none | JSON string or file path for speculative decoding config |
@@ -365,11 +366,14 @@ dies with:
 ```
 RuntimeError: Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist
 ```
-The same applies to vLLM's default top-k/top-p sampler, which also comes from
-FlashInfer. `serve.py` handles both with one check: when nvcc is not found it
-defaults to `--linear-backend cutlass` (vLLM's built-in kernels, no JIT) and
-sets `VLLM_USE_FLASHINFER_SAMPLER=0`; with the CUDA toolkit installed, vLLM
-auto-selects freely, FlashInfer backends included.
+The same applies to vLLM's fused-MoE NVFP4 backend (auto-selection prefers
+`FLASHINFER_CUTLASS`, which dies the same way during the startup profile run)
+and to the default top-k/top-p sampler, which also comes from FlashInfer.
+`serve.py` handles all three with one check: when nvcc is not found it
+defaults to `--linear-backend cutlass` and `--moe-backend cutlass` (vLLM's
+built-in kernels, no JIT) and sets `VLLM_USE_FLASHINFER_SAMPLER=0`; with the
+CUDA toolkit installed, vLLM auto-selects freely, FlashInfer backends
+included.
 
 ### Silent fallback kills performance
 A misconfigured model can run in dequantization mode (loads weights as FP4,

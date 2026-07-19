@@ -68,6 +68,11 @@ def parse_args():
                         "flashinfer_cutlass). Default: vLLM auto-selects, except "
                         "when the CUDA toolkit is missing — then 'cutlass' is used "
                         "since FlashInfer backends JIT-compile with nvcc.")
+    p.add_argument("--moe-backend", default=None,
+                   help="Force the fused-MoE kernel backend (e.g. cutlass, marlin, "
+                        "flashinfer_cutlass). Default: vLLM auto-selects, except "
+                        "when the CUDA toolkit is missing — then 'cutlass' is used "
+                        "since FlashInfer backends JIT-compile with nvcc.")
 
     # Performance
     p.add_argument("--enforce-eager", action="store_true",
@@ -119,12 +124,14 @@ def main():
 
     env = os.environ.copy()
     linear_backend = args.linear_backend
+    moe_backend = args.moe_backend
     have_nvcc = cuda_toolkit_available()
     if not have_nvcc:
-        # FlashInfer's NVFP4 GEMM and top-k/top-p sampling kernels are
-        # JIT-compiled at startup and crash without the CUDA toolkit, so
-        # steer vLLM to its built-in kernels instead.
+        # FlashInfer's NVFP4 GEMM, fused-MoE, and top-k/top-p sampling
+        # kernels are JIT-compiled at startup and crash without the CUDA
+        # toolkit, so steer vLLM to its built-in kernels instead.
         linear_backend = linear_backend or "cutlass"
+        moe_backend = moe_backend or "cutlass"
         env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
     cmd = [
@@ -152,6 +159,8 @@ def main():
         cmd += ["--quantization", args.quantization]
     if linear_backend and linear_backend != "auto":
         cmd += ["--linear-backend", linear_backend]
+    if moe_backend and moe_backend != "auto":
+        cmd += ["--moe-backend", moe_backend]
     if args.enforce_eager:
         cmd += ["--enforce-eager"]
     if args.enable_prefix_caching:
@@ -176,7 +185,7 @@ def main():
 
     if not have_nvcc:
         print("Note: CUDA toolkit (nvcc) not found — using built-in CUTLASS "
-              "kernels and disabling the FlashInfer sampler.\n")
+              "linear and MoE kernels and disabling the FlashInfer sampler.\n")
 
     try:
         subprocess.run(cmd, env=env)

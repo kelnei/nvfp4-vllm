@@ -90,12 +90,18 @@ def parse_args():
 
 
 def cuda_toolkit_available() -> bool:
-    """FlashInfer JIT-compiles kernels at startup and needs nvcc to do it."""
-    return bool(
-        shutil.which("nvcc")
-        or os.environ.get("CUDA_HOME")
-        or os.environ.get("CUDA_PATH")
-        or Path("/usr/local/cuda").exists()
+    """FlashInfer JIT-compiles kernels at startup and needs nvcc to do it.
+
+    Checking for the compiler itself matters: runtime-only CUDA installs
+    often have /usr/local/cuda (or CUDA_HOME set) without bin/nvcc.
+    """
+    if shutil.which("nvcc"):
+        return True
+    candidates = (os.environ.get("CUDA_HOME"), os.environ.get("CUDA_PATH"),
+                  "/usr/local/cuda")
+    return any(
+        home and os.access(Path(home).expanduser() / "bin" / "nvcc", os.X_OK)
+        for home in candidates
     )
 
 

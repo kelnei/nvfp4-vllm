@@ -63,11 +63,11 @@ def parse_args():
                         "compressed-tensors models.")
     p.add_argument("--kv-cache-dtype", default="auto",
                    help="KV cache dtype: auto, fp8, fp8_e5m2, fp8_e4m3")
-    p.add_argument("--linear-backend", default="cutlass",
-                   help="Linear-layer GEMM backend. Default 'cutlass' uses vLLM's "
-                        "built-in kernels; 'auto' lets vLLM pick, but it may choose "
-                        "a FlashInfer backend that requires JIT compilation (nvcc). "
-                        "Other options: marlin, flashinfer_cutlass, ...")
+    p.add_argument("--linear-backend", default=None,
+                   help="Force the linear-layer GEMM backend (e.g. cutlass, marlin, "
+                        "flashinfer_cutlass). Default: vLLM auto-selects, except "
+                        "when the CUDA toolkit is missing — then 'cutlass' is used "
+                        "since FlashInfer backends JIT-compile with nvcc.")
 
     # Performance
     p.add_argument("--enforce-eager", action="store_true",
@@ -89,11 +89,6 @@ def parse_args():
     return p.parse_known_args()
 
 
-def looks_like_local_path(model: str) -> bool:
-    """Distinguish a local path from a HuggingFace model ID."""
-    return model.startswith((".", "/", "~")) or Path(model).exists()
-
-
 def cuda_toolkit_available() -> bool:
     """FlashInfer JIT-compiles kernels at startup and needs nvcc to do it."""
     return bool(
@@ -107,11 +102,21 @@ def cuda_toolkit_available() -> bool:
 def main():
     args, extra_vllm_args = parse_args()
 
-    if looks_like_local_path(args.model):
-        if not Path(args.model).exists():
-            print(f"Error: model path '{args.model}' does not exist.", file=sys.stderr)
-            print("Run quantize.py first, or pass --model <path-or-HF-id>.", file=sys.stderr)
-            sys.exit(1)
+    # Anything not path-like is assumed to be a HuggingFace model ID.
+    if args.model.startswith((".", "/", "~")) and not Path(args.model).exists():
+        print(f"Error: model path '{args.model}' does not exist.", file=sys.stderr)
+        print("Run quantize.py first, or pass --model <path-or-HF-id>.", file=sys.stderr)
+        sys.exit(1)
+
+    env = os.environ.copy()
+    linear_backend = args.linear_backend
+    have_nvcc = cuda_toolkit_available()
+    if not have_nvcc:
+        # FlashInfer's NVFP4 GEMM and top-k/top-p sampling kernels are
+        # JIT-compiled at startup and crash without the CUDA toolkit, so
+        # steer vLLM to its built-in kernels instead.
+        linear_backend = linear_backend or "cutlass"
+        env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
     cmd = [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
@@ -136,8 +141,8 @@ def main():
         cmd += ["--max-num-seqs", str(args.max_num_seqs)]
     if args.quantization:
         cmd += ["--quantization", args.quantization]
-    if args.linear_backend and args.linear_backend != "auto":
-        cmd += ["--linear-backend", args.linear_backend]
+    if linear_backend and linear_backend != "auto":
+        cmd += ["--linear-backend", linear_backend]
     if args.enforce_eager:
         cmd += ["--enforce-eager"]
     if args.enable_prefix_caching:
@@ -160,12 +165,9 @@ def main():
     print("optimized *NvFp4LinearKernel — a warning means it fell back to emulation).")
     print("Press Ctrl+C to stop.\n")
 
-    env = os.environ.copy()
-    # vLLM enables FlashInfer's top-k/top-p sampler by default, but that
-    # kernel is JIT-compiled at startup and crashes without the CUDA toolkit.
-    if not cuda_toolkit_available():
-        env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
-        print("Note: CUDA toolkit (nvcc) not found — disabling FlashInfer sampler.\n")
+    if not have_nvcc:
+        print("Note: CUDA toolkit (nvcc) not found — using built-in CUTLASS "
+              "kernels and disabling the FlashInfer sampler.\n")
 
     try:
         subprocess.run(cmd, env=env)

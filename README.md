@@ -73,7 +73,7 @@ python chat.py
 | `--max-num-seqs` | vLLM default | Max concurrent sequences (batch size) |
 | `--quantization` | auto | Force backend (use `modelopt` for NVIDIA pre-quantized checkpoints) |
 | `--kv-cache-dtype` | `auto` | KV cache dtype: auto, fp8, fp8_e5m2, fp8_e4m3 |
-| `--linear-backend` | `cutlass` | GEMM kernel backend; `auto` lets vLLM pick but may need nvcc for FlashInfer JIT |
+| `--linear-backend` | auto (`cutlass` if nvcc missing) | Force the GEMM kernel backend (e.g. `cutlass`, `marlin`, `flashinfer_cutlass`) |
 | `--enforce-eager` | off | Disable CUDA graph compilation (useful for debugging) |
 | `--enable-prefix-caching` | off | Enable KV cache reuse across requests with shared prefixes |
 | `--speculative-config` | none | JSON string or file path for speculative decoding config |

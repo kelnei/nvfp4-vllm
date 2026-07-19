@@ -20,8 +20,13 @@ Defaults:
 """
 
 import argparse
+import json
 from pathlib import Path
 
+from compressed_tensors.utils.safetensors_load import (
+    get_safetensors_header,
+    get_weight_mappings,
+)
 from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
@@ -31,6 +36,60 @@ from transformers import (
 )
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import QuantizationModifier
+
+
+def _collect_tensor_meta(output_dir: Path) -> dict:
+    """Map every saved tensor name to its header entry ({dtype, shape, ...})."""
+    weight_map = get_weight_mappings(str(output_dir))
+    meta = {}
+    for shard_path in set(weight_map.values()):
+        header = get_safetensors_header(shard_path)
+        header.pop("__metadata__", None)
+        meta.update(header)
+    return meta
+
+
+def fix_ignore_list(output_dir: Path) -> None:
+    """
+    llm-compressor records the quantization ignore list using the live
+    transformers module hierarchy. Some architectures (e.g. Gemma 4) rename
+    modules between that hierarchy and the on-disk checkpoint via a checkpoint
+    conversion mapping, so the recorded names don't match what vLLM (which
+    loads directly from checkpoint tensor names) expects. Add the on-disk name
+    of every unquantized 2D float weight to the ignore list. The recorded
+    transformers-side names are kept alongside: transformers matches ignore
+    against its live module names when reloading the checkpoint, so both
+    spellings are needed.
+    """
+    config_path = output_dir / "config.json"
+    config = json.loads(config_path.read_text())
+    qconfig = config.get("quantization_config")
+    if qconfig is None:
+        return
+
+    tensors = _collect_tensor_meta(output_dir)
+    quantized_prefixes = {
+        k[: -len(".weight_packed")] for k in tensors if k.endswith(".weight_packed")
+    }
+
+    original = set(qconfig.get("ignore", []))
+    ignore = set(original)
+    for key, meta in tensors.items():
+        if not key.endswith(".weight"):
+            continue
+        prefix = key[: -len(".weight")]
+        if prefix in quantized_prefixes:
+            continue
+        if len(meta["shape"]) != 2 or meta["dtype"] not in ("F64", "F32", "F16", "BF16"):
+            continue
+        ignore.add(prefix)
+
+    if ignore == original:
+        return
+
+    qconfig["ignore"] = sorted(ignore)
+    config_path.write_text(json.dumps(config, indent=2))
+    print(f"Added on-disk layer names to quantization ignore list ({len(ignore)} entries).")
 
 
 def parse_args():
@@ -164,6 +223,8 @@ def main():
         if hasattr(processor, "image_processor"):
             processor.image_processor.save_pretrained(output_dir)
         print("Saved processor config (multimodal model)")
+
+    fix_ignore_list(Path(output_dir))
 
     size_mb = sum(
         f.stat().st_size for f in Path(output_dir).rglob("*") if f.is_file()

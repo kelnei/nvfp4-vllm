@@ -69,6 +69,9 @@ Expected output:
 ## 2. Quantize a Model
 
 The script [`quantize.py`](quantize.py) handles both W4A4 and W4A16 modes.
+For multimodal models, use [`inspect_layers.py`](inspect_layers.py) first to
+find the right `--ignore` layers — see [Multimodal models](#multimodal-models-gemma-4-etc)
+below.
 
 ### Quick demo (W4A4, 0.5B model)
 
@@ -106,26 +109,56 @@ python quantize.py \
 
 ### Multimodal models (Gemma 4, etc.)
 
-Models with vision/audio components need those layers excluded from quantization.
-Use `--ignore` with regex patterns:
+Models with vision/audio components need those layers excluded from quantization,
+and MoE variants additionally need their router layers excluded. Don't guess the
+layer names — different Gemma 4 variants have used different module names for
+their embedders (`vision_tower` vs `vision_embedder` vs `embed_vision`), and a
+pattern that doesn't match means those layers get silently quantized instead of
+skipped. Use [`inspect_layers.py`](inspect_layers.py) first — it builds the
+model on a meta device (architecture only, no weights downloaded; only the
+config is fetched) and works out what to ignore from the module structure:
+standalone Linear layers outside the decoder stack, encoder-tower stacks, and
+MoE routers (in-stack Linears whose `out_features == num_experts`):
+
+```bash
+python inspect_layers.py --model google/gemma-4-12B-it --trust-remote-code
+```
+
+```
+328 Linear layers in the main decoder stack under 'model.language_model' (quantization targets), e.g.:
+  model.language_model.layers.0.self_attn.q_proj
+  ...
+
+4 standalone Linear layers (--ignore candidates):
+  lm_head
+  model.embed_audio.embedding_projection
+  model.embed_vision.multimodal_embedder.embedding_projection
+  model.embed_vision.patch_dense
+
+Suggested --ignore args:
+lm_head model.embed_audio.embedding_projection model.embed_vision.multimodal_embedder.embedding_projection model.embed_vision.patch_dense
+```
+
+Feed the suggestion into `--ignore` — either paste the last line, or use
+`--args-only`, which prints *only* the args on stdout (notes go to stderr) so
+it is safe in shell substitution:
 
 ```bash
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Dense model (31B)
 python quantize.py \
-  --model google/gemma-4-31B-it \
+  --model google/gemma-4-12B-it \
   --samples 512 \
   --max-len 2048 \
-  --ignore lm_head "re:.*vision_tower.*" "re:.*audio_tower.*" "re:.*embed_vision.*" "re:.*embed_audio.*"
-
-# MoE model (26B-A4B)
-python quantize.py \
-  --model google/gemma-4-26B-A4B-it \
-  --samples 512 \
-  --max-len 2048 \
-  --ignore lm_head "re:.*vision_tower.*" "re:.*audio_tower.*" "re:.*embed_vision.*" "re:.*embed_audio.*" "re:.*router.*"
+  --trust-remote-code \
+  --ignore $(python inspect_layers.py --model google/gemma-4-12B-it --trust-remote-code --args-only)
 ```
+
+This covers MoE variants too — for `google/gemma-4-26B-A4B-it` the tool emits
+`re:model\.vision_tower\.encoder\..*` for the vision tower's own encoder stack
+and `re:.*\.router\.proj$` for the 30 router layers, alongside the standalone
+layers. Review its output (it prints a warning when it finds encoder towers)
+before starting a long quantization run.
 
 Expected output (0.5B model completes in under a minute):
 ```
@@ -342,6 +375,39 @@ auto-selects freely, FlashInfer backends included.
 A misconfigured model can run in dequantization mode (loads weights as FP4,
 immediately expands to BF16 for compute) — correct VRAM usage but no speedup.
 Check logs for `NVFP4` kernel mentions to confirm.
+
+### llm-compressor's recorded ignore list can mismatch vLLM's module names
+Symptom at `vllm serve` time:
+```
+ValueError: There is no module or parameter named '<module>.weight' in
+<Model>ForConditionalGeneration. The available parameters belonging to
+<module> (ColumnParallelLinear) are: {'weight_scale', 'weight_packed', ...}
+```
+This means the layer was correctly *excluded* from quantization (its saved
+weight is plain, unquantized) but `config.json`'s `quantization_config.ignore`
+lists it under the wrong name, so vLLM builds it as a quantized layer anyway
+and can't find the packed weights it expects.
+
+Cause: llm-compressor records `ignore` using the *live* transformers module
+hierarchy at quantization time. Some architectures rename modules between
+that live hierarchy and the on-disk checkpoint/vLLM naming via a checkpoint
+conversion mapping (seen on Gemma 4: transformers calls it
+`embed_vision.patch_dense`, the checkpoint and vLLM both call it
+`vision_embedder.patch_dense`). The two names refer to the same tensor, but
+`ignore` only has the transformers-side name, so vLLM's own name doesn't
+match.
+
+`quantize.py` now runs `fix_ignore_list()` after every save: it scans the
+saved safetensors headers for 2D float weights that aren't in packed NVFP4
+form and adds their actual on-disk tensor names to
+`quantization_config.ignore`, which is guaranteed to match what vLLM loads.
+The recorded transformers-side names are kept alongside, since transformers
+matches against those when reloading the checkpoint itself. No manual
+`config.json` editing should be needed. If you hit the error above on an
+*older* checkpoint produced before this fix, re-run just the fix step:
+```bash
+python -c "from pathlib import Path; from quantize import fix_ignore_list; fix_ignore_list(Path('./your-model-NVFP4'))"
+```
 
 ---
 

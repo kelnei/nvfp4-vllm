@@ -188,6 +188,7 @@ The original FP16 model is ~950 MB — roughly 2× smaller for W4A4.
 | `--max-len` | `512` | Max tokens per calibration sample |
 | `--weight-only` | off | Use W4A16 instead of W4A4 |
 | `--ignore` | `lm_head` | Layer names/regex patterns to exclude (use `re:` prefix for regex) |
+| `--pipeline` | `auto` | Calibration pipeline: `auto`, `sequential`, or `basic`. See [Untraceable architectures](#untraceable-architectures) |
 | `--dtype` | `auto` | Model dtype: auto, bfloat16, float16 |
 | `--trust-remote-code` | off | Trust remote code when loading model/tokenizer |
 | `--dataset` | `HuggingFaceH4/ultrachat_200k` | HuggingFace dataset for calibration |
@@ -451,6 +452,44 @@ matches against those when reloading the checkpoint itself. No manual
 ```bash
 python -c "from pathlib import Path; from quantize import fix_ignore_list; fix_ignore_list(Path('./your-model-NVFP4'))"
 ```
+
+### Untraceable architectures
+Symptom during calibration:
+```
+Expected 64 subgraphs, traced 36
+KeyError: 'sliding_attention'
+```
+llm-compressor's default pipeline traces the model's forward into per-layer
+subgraphs so it can calibrate one layer at a time. Architectures that index
+into runtime-built dicts (gemma-4 E-series looks up shared KV states by
+attention type) break the tracer. Pass `--pipeline basic` to run plain
+full-model forwards instead. Two consequences:
+
+- With GPTQ, every target module's Hessian is live at once, so peak memory is
+  much higher than sequential calibration.
+- The imatrix gatherer can't share a calibration epoch with GPTQ under
+  `basic` (GPTQ's observers claim the module accumulators before any data has
+  flowed), so `quantize.py` runs a separate gathering pass first. Two
+  `Applying/Gathering ...` phases in the log is expected there. Confirm the
+  statistics survived by checking the log has no
+  `Falling back to uniform MSE` warnings.
+
+### Checkpoint heads transformers doesn't implement
+Some checkpoints ship auxiliary weights that upstream transformers has no
+module for — e.g. Qwen3.6's `mtp.*` multi-token-prediction head, which vLLM
+uses for speculative decoding. transformers silently drops them on load, so
+they would be missing from the quantized output and speculative decoding
+would be unavailable. After saving, `quantize.py` copies any whole top-level
+component that exists in the source checkpoint but in neither the live module
+tree nor the saved output into an extra shard, and writes a
+`model.safetensors.index.json` covering all shards (a lone
+`model.safetensors` would otherwise be read on its own, ignoring the extra
+file). `fix_ignore_list()` then adds the copied weights to
+`quantization_config.ignore` so loaders don't expect packed tensors for them.
+
+Relatedly, `quantize.py` loads through the class named in the checkpoint's
+`config.json` `architectures` field rather than `AutoModelForCausalLM`, which
+would drop the whole vision tower on multimodal checkpoints.
 
 ---
 

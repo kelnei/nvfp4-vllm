@@ -61,12 +61,34 @@ try:
     from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
 except ImportError:
     IMatrixGatherer = None
+
+import transformers
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
     AutoProcessor,
     AutoTokenizer,
     PreTrainedTokenizerBase,
 )
+
+if IMatrixGatherer is not None:
+
+    class _PersistentIMatrixGatherer(IMatrixGatherer):
+        """IMatrixGatherer whose collected statistics survive session finalize.
+
+        With --pipeline basic the gatherer cannot share a calibration epoch
+        with GPTQ (GPTQ's imatrix observers pick up — and delete — the
+        module accumulators at epoch start, before any data has flowed), so
+        the gathering runs as its own oneshot session first. The base class
+        deletes the accumulators on finalize; this subclass leaves them on
+        the modules for the next session's observers to pick up.
+        """
+
+        def on_finalize(self, state, **kwargs) -> bool:
+            if not self.ended_:
+                self.on_end(state, None)
+            return True
+
 
 # Attention projections kept at FP8 by --fp8-attn. Name-based, so fused-QKV
 # and MLA architectures won't match; main() verifies the pattern hits at
@@ -97,7 +119,109 @@ def _collect_tensor_meta(output_dir: Path) -> dict:
     return meta
 
 
-def fix_ignore_list(output_dir: Path) -> None:
+def _resolve_checkpoint_dir(model_id: str) -> Path | None:
+    """Local directory holding model_id's safetensors (hub cache if needed)."""
+    local = Path(model_id)
+    if local.is_dir():
+        return local
+    try:
+        from huggingface_hub import snapshot_download
+
+        return Path(
+            snapshot_download(
+                model_id,
+                allow_patterns=["*.safetensors", "*.safetensors.index.json"],
+            )
+        )
+    except Exception as exc:  # offline, gated, or not a hub id
+        print(f"Could not resolve source checkpoint for {model_id}: {exc}")
+        return None
+
+
+def preserve_dropped_tensors(model_id: str, output_dir: Path, model) -> None:
+    """
+    Copy source-checkpoint tensors that the loaded model class has no home for.
+
+    transformers only materializes modules its architecture class implements.
+    Auxiliary heads shipped in a checkpoint but unimplemented upstream (e.g.
+    Qwen3.6's `mtp.*` multi-token-prediction head, which vLLM uses for
+    speculative decoding) are dropped on load and would be silently absent
+    from the quantized output. Copy them across verbatim.
+
+    Only whole top-level components missing from both the live module tree and
+    the saved checkpoint are copied, so renamed-on-save modules (which do have
+    a live counterpart) are never duplicated.
+    """
+    src_dir = _resolve_checkpoint_dir(model_id)
+    if src_dir is None:
+        return
+    try:
+        src_map = get_weight_mappings(str(src_dir))
+    except Exception as exc:
+        print(f"Could not read source checkpoint tensor list: {exc}")
+        return
+
+    live_roots = {
+        name.split(".")[0]
+        for name, _ in list(model.named_parameters()) + list(model.named_buffers())
+    }
+    saved = _collect_tensor_meta(output_dir)
+    saved_roots = {name.split(".")[0] for name in saved}
+    dropped_roots = {name.split(".")[0] for name in src_map} - live_roots - saved_roots
+    if not dropped_roots:
+        return
+
+    names = sorted(name for name in src_map if name.split(".")[0] in dropped_roots)
+    print(
+        f"Preserving {len(names)} tensor(s) the model class dropped: "
+        f"{', '.join(sorted(dropped_roots))}"
+    )
+
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    tensors = {}
+    by_shard = {}
+    for name in names:
+        by_shard.setdefault(src_map[name], []).append(name)
+    for shard, shard_names in by_shard.items():
+        with safe_open(shard, framework="pt") as f:
+            for name in shard_names:
+                tensors[name] = f.get_tensor(name)
+
+    # The extra tensors go in a shard of their own, which means renumbering the
+    # existing ones into a sharded layout: loaders that find a lone
+    # model.safetensors read only that file and ignore any index, so a
+    # single-file output would silently drop the additions again. Renames are
+    # metadata-only, so this is cheap even for a 27 GB shard.
+    existing = sorted(output_dir.glob("*.safetensors"))
+    total = len(existing) + 1
+    shards = []
+    for i, path in enumerate(existing, start=1):
+        renamed = output_dir / f"model-{i:05d}-of-{total:05d}.safetensors"
+        if path != renamed:
+            path.rename(renamed)
+        shards.append(renamed)
+    new_shard = output_dir / f"model-{total:05d}-of-{total:05d}.safetensors"
+    save_file(tensors, str(new_shard), metadata={"format": "pt"})
+    shards.append(new_shard)
+
+    weight_map, total_size = {}, 0
+    for path in shards:
+        header = get_safetensors_header(str(path))
+        header.pop("__metadata__", None)
+        for key, meta in header.items():
+            weight_map[key] = path.name
+            start, end = meta["data_offsets"]
+            total_size += end - start
+    (output_dir / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {"metadata": {"total_size": total_size}, "weight_map": weight_map}, indent=2
+        )
+    )
+
+
+def fix_ignore_list(output_dir: Path, extra_ignore: list[str] | None = None) -> None:
     """
     llm-compressor records the quantization ignore list using the live
     transformers module hierarchy. Some architectures (e.g. Gemma 4) rename
@@ -108,6 +232,13 @@ def fix_ignore_list(output_dir: Path) -> None:
     transformers-side names are kept alongside: transformers matches ignore
     against its live module names when reloading the checkpoint, so both
     spellings are needed.
+
+    extra_ignore re-appends the user's --ignore patterns: llm-compressor
+    expands regex patterns to the concrete modules it skipped, which loses
+    weightless wrapper containers (e.g. the gemma-4 E-series
+    Gemma4ClippableLinear around each tower projection). Group targets still
+    match those wrappers when transformers re-applies the config on reload,
+    so without the patterns the reload crashes on an unquantizable type.
     """
     config_path = output_dir / "config.json"
     config = json.loads(config_path.read_text())
@@ -122,6 +253,7 @@ def fix_ignore_list(output_dir: Path) -> None:
 
     original = set(qconfig.get("ignore", []))
     ignore = set(original)
+    ignore.update(extra_ignore or [])
     for key, meta in tensors.items():
         if not key.endswith(".weight"):
             continue
@@ -226,6 +358,17 @@ def parse_args():
         "ultrachat_200k, train otherwise)",
     )
     p.add_argument(
+        "--pipeline",
+        choices=["auto", "sequential", "basic"],
+        default="auto",
+        help="Calibration pipeline. 'auto' lets llm-compressor infer one "
+        "(sequential tracing for GPTQ). 'basic' runs plain full-model "
+        "forwards; use it for architectures whose forward cannot be traced "
+        "into per-layer subgraphs (e.g. gemma-4 E-series shared-KV lookups "
+        "fail under the sequential tracer). With GPTQ, basic keeps every "
+        "target module's hessian in memory at once.",
+    )
+    p.add_argument(
         "--cpu-offload",
         action="store_true",
         help="Load model to CPU/system RAM; llm-compressor dispatches "
@@ -307,7 +450,20 @@ def main():
         load_kwargs["device_map"] = "auto"
     if args.trust_remote_code:
         load_kwargs["trust_remote_code"] = True
-    model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+    # Load the class the checkpoint declares. AutoModelForCausalLM strips some
+    # multimodal models to their text submodel (e.g. Qwen3.5's
+    # ...ForConditionalGeneration resolves to ...ForCausalLM), which would
+    # silently drop the vision tower from the saved checkpoint.
+    model_cls = AutoModelForCausalLM
+    config = AutoConfig.from_pretrained(
+        model_id, trust_remote_code=args.trust_remote_code
+    )
+    declared = (getattr(config, "architectures", None) or [None])[0]
+    if declared is not None and hasattr(transformers, declared):
+        model_cls = getattr(transformers, declared)
+        if model_cls is not AutoModelForCausalLM:
+            print(f"Model class: {declared} (declared by checkpoint config)")
+    model = model_cls.from_pretrained(model_id, **load_kwargs)
     tokenizer = AutoTokenizer.from_pretrained(
         model_id, trust_remote_code=args.trust_remote_code
     )
@@ -370,6 +526,7 @@ def main():
         mlp_scheme = preset_name_to_scheme(scheme, [GPTQ_MLP_TARGET])
         mlp_scheme.weights.observer = "imatrix_mse"
         mlp_scheme.weights.actorder = "static"
+        gather_recipe = None
         recipe = [
             QuantizationModifier(
                 config_groups=config_groups,
@@ -385,10 +542,19 @@ def main():
             # llm-compressor 0.12.0 only collects imatrix importance stats
             # when the gatherer runs first; nightlies self-collect (the class
             # is gone there, hence the guarded import).
-            recipe.insert(
-                0, IMatrixGatherer(targets=[GPTQ_MLP_TARGET], ignore=args.ignore)
-            )
+            if args.pipeline == "basic":
+                # The basic pipeline runs every modifier in one shared
+                # calibration epoch, which breaks the gatherer-before-GPTQ
+                # ordering — gather in a separate session instead.
+                gather_recipe = _PersistentIMatrixGatherer(
+                    targets=[GPTQ_MLP_TARGET], ignore=args.ignore
+                )
+            else:
+                recipe.insert(
+                    0, IMatrixGatherer(targets=[GPTQ_MLP_TARGET], ignore=args.ignore)
+                )
     else:
+        gather_recipe = None
         recipe = QuantizationModifier(
             config_groups=config_groups,
             ignore=args.ignore,
@@ -451,6 +617,19 @@ def main():
         ds = ds.map(preprocess)
         ds = ds.map(tokenize, remove_columns=ds.column_names)
 
+        oneshot_kwargs = {}
+        if args.pipeline != "auto":
+            oneshot_kwargs["pipeline"] = args.pipeline
+        if gather_recipe is not None:
+            print("Gathering imatrix statistics (separate calibration pass)...")
+            oneshot(
+                model=model,
+                dataset=ds,
+                recipe=gather_recipe,
+                max_seq_length=args.max_len,
+                num_calibration_samples=args.samples,
+                **oneshot_kwargs,
+            )
         print("Applying NVFP4 quantization with calibration data...")
         oneshot(
             model=model,
@@ -458,6 +637,7 @@ def main():
             recipe=recipe,
             max_seq_length=args.max_len,
             num_calibration_samples=args.samples,
+            **oneshot_kwargs,
         )
 
     for attr in kv_shim_attrs:
@@ -482,7 +662,8 @@ def main():
             processor.image_processor.save_pretrained(output_dir)
         print("Saved processor config (multimodal model)")
 
-    fix_ignore_list(Path(output_dir))
+    preserve_dropped_tensors(model_id, Path(output_dir), model)
+    fix_ignore_list(Path(output_dir), extra_ignore=args.ignore)
 
     size_mb = (
         sum(f.stat().st_size for f in Path(output_dir).rglob("*") if f.is_file())

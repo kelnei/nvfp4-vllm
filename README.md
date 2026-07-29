@@ -51,6 +51,7 @@ python chat.py
 | `--fp8-attn` | on | Keep attention q/k/v/o projections at FP8 and calibrate an FP8 KV cache scale (KV scale skipped with `--weight-only`); disable with `--no-fp8-attn` for uniform NVFP4 |
 | `--gptq-mlp` | `auto` | Quantize dense MLP gate/up/down projections with GPTQ error compensation (imatrix_mse observer + static actorder): same on-disk format and serving cost, ~20% lower KL vs the BF16 original. `auto` enables it for dense models and skips MoE, `--weight-only`, and `--no-fp8-attn` runs; `on`/`off` force it |
 | `--ignore` | `lm_head` | Layer names/regex patterns to exclude (use `re:` prefix for regex) |
+| `--pipeline` | `auto` | Calibration pipeline. `basic` runs plain full-model forwards — needed for architectures the sequential tracer cannot split into per-layer subgraphs (e.g. gemma-4 E-series shared-KV lookups) |
 | `--dtype` | `auto` | Model dtype: auto, bfloat16, float16 |
 | `--trust-remote-code` | off | Trust remote code when loading model/tokenizer |
 | `--dataset` | `HuggingFaceH4/ultrachat_200k` | HuggingFace dataset for calibration |

@@ -23,6 +23,11 @@ Effective storage is ~4.5 bits/value — about **3.5× smaller than FP16**.
 W4A4 is faster at inference (both matrix sides are FP4); W4A16 is simpler to produce
 but gives less throughput improvement.
 
+In both modes `quantize.py` keeps the attention q/k/v/o projections at FP8 by
+default (and, for W4A4, calibrates an FP8 KV cache scale) — FP8 attention is
+~3.5x closer to the original weights than NVFP4 for a small size cost. Pass
+`--no-fp8-attn` for uniform NVFP4.
+
 **Hardware requirement:** Blackwell GPUs (SM 12.0+). On older architectures vLLM falls
 back to weight-only dequantization, losing most of the speedup.
 

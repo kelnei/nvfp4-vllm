@@ -1,10 +1,16 @@
 """
 Quantize a model to NVFP4 (W4A4) using llm-compressor.
 
+By default attention q/k/v/o projections are kept at FP8 (channel-wise
+weights, dynamic per-token activations) and an FP8 KV cache scale is
+calibrated, matching the mixed-precision layout used by NVIDIA/unsloth
+NVFP4 checkpoints. FP8 attention is ~3.5x closer to the original weights
+than NVFP4 for a small size cost (~13% on a dense 12B, ~1% on a MoE).
+
 Usage:
     python quantize.py [--model MODEL_ID] [--output OUTPUT_DIR]
                        [--samples N] [--max-len N] [--weight-only]
-                       [--ignore PATTERN ...] [--dtype TYPE]
+                       [--no-fp8-attn] [--ignore PATTERN ...] [--dtype TYPE]
                        [--trust-remote-code] [--dataset DATASET] [--split SPLIT]
 
 Defaults:
@@ -13,6 +19,8 @@ Defaults:
     samples    = 256
     max-len    = 512
     weight-only = False (W4A4; set flag for W4A16)
+    fp8-attn   = True (FP8 attention + FP8 KV cache; the KV cache scale
+                 needs calibration, so it is skipped with --weight-only)
     ignore     = lm_head
     dtype      = auto
     dataset    = HuggingFaceH4/ultrachat_200k
@@ -23,19 +31,35 @@ import argparse
 import json
 from pathlib import Path
 
+from compressed_tensors.quantization import (
+    QuantizationArgs,
+    preset_name_to_scheme,
+)
+from compressed_tensors.utils import match_name
 from compressed_tensors.utils.safetensors_load import (
     get_safetensors_header,
     get_weight_mappings,
 )
 from datasets import load_dataset
+from llmcompressor import oneshot
+from llmcompressor.modifiers.quantization import QuantizationModifier
 from transformers import (
     AutoModelForCausalLM,
     AutoProcessor,
     AutoTokenizer,
     PreTrainedTokenizerBase,
 )
-from llmcompressor import oneshot
-from llmcompressor.modifiers.quantization import QuantizationModifier
+
+# Attention projections kept at FP8 by --fp8-attn. Name-based, so fused-QKV
+# and MLA architectures won't match; main() verifies the pattern hits at
+# least one module before quantizing.
+FP8_ATTN_TARGET = r"re:.*self_attn\.(q|k|v|o)_proj$"
+# vLLM fuses q/k/v into a single qkv_proj module and resolves its scheme by
+# layer name before class name, so the saved config must name the fused module
+# too — otherwise the broad Linear/NVFP4 target wins and vLLM tries to load
+# the FP8 shards as NVFP4. Matches nothing at quantization time, where the
+# projections are still unfused.
+FP8_ATTN_FUSED_TARGET = r"re:.*self_attn\.qkv_proj$"
 
 
 def _collect_tensor_meta(output_dir: Path) -> dict:
@@ -80,7 +104,12 @@ def fix_ignore_list(output_dir: Path) -> None:
         prefix = key[: -len(".weight")]
         if prefix in quantized_prefixes:
             continue
-        if len(meta["shape"]) != 2 or meta["dtype"] not in ("F64", "F32", "F16", "BF16"):
+        if len(meta["shape"]) != 2 or meta["dtype"] not in (
+            "F64",
+            "F32",
+            "F16",
+            "BF16",
+        ):
             continue
         ignore.add(prefix)
 
@@ -89,36 +118,81 @@ def fix_ignore_list(output_dir: Path) -> None:
 
     qconfig["ignore"] = sorted(ignore)
     config_path.write_text(json.dumps(config, indent=2))
-    print(f"Added on-disk layer names to quantization ignore list ({len(ignore)} entries).")
+    print(
+        f"Added on-disk layer names to quantization ignore list ({len(ignore)} entries)."
+    )
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
-    p.add_argument("--output", default=None,
-                   help="Output directory (default: <model-basename>-NVFP4)")
-    p.add_argument("--samples", type=int, default=256,
-                   help="Number of calibration samples (more = better accuracy)")
-    p.add_argument("--max-len", type=int, default=512,
-                   help="Max token length per calibration sample")
-    p.add_argument("--weight-only", action="store_true",
-                   help="W4A16 (weights only, no calibration data needed)")
-    p.add_argument("--ignore", nargs="+", default=["lm_head"],
-                   help="Layer names/regex patterns to exclude from quantization "
-                        "(default: lm_head). Use re: prefix for regex patterns.")
-    p.add_argument("--dtype", default="auto",
-                   help="Model dtype: auto, bfloat16, float16 (default: auto)")
-    p.add_argument("--trust-remote-code", action="store_true",
-                   help="Trust remote code when loading model/tokenizer")
-    p.add_argument("--dataset", default="HuggingFaceH4/ultrachat_200k",
-                   help="HuggingFace dataset for calibration (default: HuggingFaceH4/ultrachat_200k)")
-    p.add_argument("--split", default=None,
-                   help="Dataset split for calibration (default: train_sft for "
-                        "ultrachat_200k, train otherwise)")
-    p.add_argument("--cpu-offload", action="store_true",
-                   help="Load model to CPU/system RAM; llm-compressor dispatches "
-                        "layers to GPU during calibration. Use for large MoE models "
-                        "that don't fit alongside expert-unpacking overhead.")
+    p.add_argument(
+        "--output",
+        default=None,
+        help="Output directory (default: <model-basename>-NVFP4)",
+    )
+    p.add_argument(
+        "--samples",
+        type=int,
+        default=256,
+        help="Number of calibration samples (more = better accuracy)",
+    )
+    p.add_argument(
+        "--max-len",
+        type=int,
+        default=512,
+        help="Max token length per calibration sample",
+    )
+    p.add_argument(
+        "--weight-only",
+        action="store_true",
+        help="W4A16 (weights only, no calibration data needed)",
+    )
+    p.add_argument(
+        "--fp8-attn",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep attention q/k/v/o projections at FP8 (channel-wise weights, "
+        "dynamic per-token activations) instead of NVFP4, and calibrate an "
+        "FP8 KV cache scale. The KV cache scale needs calibration data, so "
+        "it is skipped with --weight-only. Disable with --no-fp8-attn for "
+        "uniform NVFP4.",
+    )
+    p.add_argument(
+        "--ignore",
+        nargs="+",
+        default=["lm_head"],
+        help="Layer names/regex patterns to exclude from quantization "
+        "(default: lm_head). Use re: prefix for regex patterns.",
+    )
+    p.add_argument(
+        "--dtype",
+        default="auto",
+        help="Model dtype: auto, bfloat16, float16 (default: auto)",
+    )
+    p.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Trust remote code when loading model/tokenizer",
+    )
+    p.add_argument(
+        "--dataset",
+        default="HuggingFaceH4/ultrachat_200k",
+        help="HuggingFace dataset for calibration (default: HuggingFaceH4/ultrachat_200k)",
+    )
+    p.add_argument(
+        "--split",
+        default=None,
+        help="Dataset split for calibration (default: train_sft for "
+        "ultrachat_200k, train otherwise)",
+    )
+    p.add_argument(
+        "--cpu-offload",
+        action="store_true",
+        help="Load model to CPU/system RAM; llm-compressor dispatches "
+        "layers to GPU during calibration. Use for large MoE models "
+        "that don't fit alongside expert-unpacking overhead.",
+    )
     return p.parse_args()
 
 
@@ -130,8 +204,45 @@ def main():
     suffix = "-NVFP4-W4A16" if args.weight_only else "-NVFP4"
     output_dir = args.output or (basename + suffix)
 
+    scheme = "NVFP4A16" if args.weight_only else "NVFP4"
+    # Regex targets outrank the class-name target when a module matches both
+    # groups, so attention projections land in the FP8 group and every other
+    # Linear falls through to NVFP4.
+    config_groups = {"group_0": preset_name_to_scheme(scheme, ["Linear"])}
+    kv_cache_scheme = None
+    if args.fp8_attn:
+        attn_scheme = preset_name_to_scheme(
+            "FP8_DYNAMIC", [FP8_ATTN_TARGET, FP8_ATTN_FUSED_TARGET]
+        )
+        if args.weight_only:
+            # Honor the A16 contract: FP8 weights only (W8A16), activations
+            # stay at model dtype. The KV cache scale is skipped because its
+            # static observer needs calibration data.
+            attn_scheme.input_activations = None
+        else:
+            kv_cache_scheme = QuantizationArgs(
+                num_bits=8,
+                type="float",
+                strategy="tensor",
+                symmetric=True,
+                dynamic=False,
+                observer="static_minmax",
+            )
+        config_groups["group_1"] = attn_scheme
+    recipe = QuantizationModifier(
+        config_groups=config_groups,
+        ignore=args.ignore,
+        kv_cache_scheme=kv_cache_scheme,
+    )
+
+    mode = "W4A16 (weight-only)" if args.weight_only else "W4A4 (weights + activations)"
+    if args.fp8_attn:
+        mode += " + FP8 attention"
+    if kv_cache_scheme is not None:
+        mode += " + FP8 KV cache"
+
     print(f"Model:       {model_id}")
-    print(f"Mode:        {'W4A16 (weight-only)' if args.weight_only else 'W4A4 (weights + activations)'}")
+    print(f"Mode:        {mode}")
     print(f"Output dir:  {output_dir}")
     print(f"Dtype:       {args.dtype}")
     print(f"Ignore:      {args.ignore}")
@@ -150,8 +261,14 @@ def main():
         model_id, trust_remote_code=args.trust_remote_code
     )
 
-    scheme = "NVFP4A16" if args.weight_only else "NVFP4"
-    recipe = QuantizationModifier(targets="Linear", scheme=scheme, ignore=args.ignore)
+    if args.fp8_attn and not any(
+        match_name(name, FP8_ATTN_TARGET) for name, _ in model.named_modules()
+    ):
+        raise SystemExit(
+            f"--fp8-attn matched no modules ({FP8_ATTN_TARGET!r}); this "
+            "architecture likely fuses QKV or uses MLA naming. Rerun with "
+            "--no-fp8-attn or adjust FP8_ATTN_TARGET."
+        )
 
     if args.weight_only:
         print("Running weight-only quantization (no calibration data needed)...")
@@ -226,9 +343,10 @@ def main():
 
     fix_ignore_list(Path(output_dir))
 
-    size_mb = sum(
-        f.stat().st_size for f in Path(output_dir).rglob("*") if f.is_file()
-    ) / 1024**2
+    size_mb = (
+        sum(f.stat().st_size for f in Path(output_dir).rglob("*") if f.is_file())
+        / 1024**2
+    )
     print(f"Done. Output size: {size_mb:.0f} MB  (saved to ./{output_dir})")
 
 

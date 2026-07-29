@@ -29,66 +29,124 @@ def parse_args():
     p = argparse.ArgumentParser()
 
     # Model and server basics
-    p.add_argument("--model", default="./Qwen2.5-0.5B-Instruct-NVFP4",
-                   help="Path to quantized model directory, or a HuggingFace model ID")
-    p.add_argument("--host", default="0.0.0.0",
-                   help="Bind address (default: 0.0.0.0)")
+    p.add_argument(
+        "--model",
+        default="./Qwen2.5-0.5B-Instruct-NVFP4",
+        help="Path to quantized model directory, or a HuggingFace model ID",
+    )
+    p.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
     p.add_argument("--port", type=int, default=8000)
-    p.add_argument("--served-model-name", default=None,
-                   help="Model name exposed in the API (defaults to model path)")
-    p.add_argument("--dtype", default="auto",
-                   help="Model dtype: auto, bfloat16, float16, float32")
-    p.add_argument("--seed", type=int, default=None,
-                   help="Random seed for reproducibility")
-    p.add_argument("--trust-remote-code", action="store_true",
-                   help="Trust remote code when loading model/tokenizer")
+    p.add_argument(
+        "--served-model-name",
+        default=None,
+        help="Model name exposed in the API (defaults to model path)",
+    )
+    p.add_argument(
+        "--dtype", default="auto", help="Model dtype: auto, bfloat16, float16, float32"
+    )
+    p.add_argument(
+        "--seed", type=int, default=None, help="Random seed for reproducibility"
+    )
+    p.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Trust remote code when loading model/tokenizer",
+    )
 
     # Memory and parallelism
     p.add_argument("--max-model-len", type=int, default=32768)
-    p.add_argument("--gpu-memory-utilization", type=float, default=0.90,
-                   help="Fraction of VRAM vLLM may use (model + KV cache). "
-                        "Default 0.90 pre-allocates ~86 GB on a 96 GB card. "
-                        "Use 0.3 or lower for small models during development.")
-    p.add_argument("--tensor-parallel-size", "-tp", type=int, default=1,
-                   help="Number of GPUs for tensor parallelism")
-    p.add_argument("--pipeline-parallel-size", "-pp", type=int, default=1,
-                   help="Number of GPUs for pipeline parallelism")
-    p.add_argument("--max-num-seqs", type=int, default=None,
-                   help="Max concurrent sequences (batch size)")
+    p.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.90,
+        help="Fraction of VRAM vLLM may use (model + KV cache). "
+        "Default 0.90 pre-allocates ~86 GB on a 96 GB card. "
+        "Use 0.3 or lower for small models during development.",
+    )
+    p.add_argument(
+        "--tensor-parallel-size",
+        "-tp",
+        type=int,
+        default=1,
+        help="Number of GPUs for tensor parallelism",
+    )
+    p.add_argument(
+        "--pipeline-parallel-size",
+        "-pp",
+        type=int,
+        default=1,
+        help="Number of GPUs for pipeline parallelism",
+    )
+    p.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=None,
+        help="Max concurrent sequences (batch size)",
+    )
 
     # Quantization and KV cache
-    p.add_argument("--quantization", default=None,
-                   help="Force quantization backend (e.g. 'modelopt' for NVIDIA "
-                        "pre-quantized checkpoints). Auto-detected for "
-                        "compressed-tensors models.")
-    p.add_argument("--kv-cache-dtype", default="auto",
-                   help="KV cache dtype: auto, fp8, fp8_e5m2, fp8_e4m3")
-    p.add_argument("--linear-backend", default=None,
-                   help="Force the linear-layer GEMM backend (e.g. cutlass, marlin, "
-                        "flashinfer_cutlass). Default: vLLM auto-selects, except "
-                        "when the CUDA toolkit is missing — then 'cutlass' is used "
-                        "since FlashInfer backends JIT-compile with nvcc.")
-    p.add_argument("--moe-backend", default=None,
-                   help="Force the fused-MoE kernel backend (e.g. cutlass, marlin, "
-                        "flashinfer_cutlass). Default: vLLM auto-selects, except "
-                        "when the CUDA toolkit is missing — then 'cutlass' is used "
-                        "since FlashInfer backends JIT-compile with nvcc.")
+    p.add_argument(
+        "--quantization",
+        default=None,
+        help="Force quantization backend (e.g. 'modelopt' for NVIDIA "
+        "pre-quantized checkpoints). Auto-detected for "
+        "compressed-tensors models.",
+    )
+    p.add_argument(
+        "--kv-cache-dtype",
+        default="auto",
+        help="KV cache dtype: auto, fp8, fp8_e5m2, fp8_e4m3. With 'auto', "
+        "vLLM selects fp8 on its own when the checkpoint declares an FP8 "
+        "kv_cache_scheme (calibrated k/v scales); pass an explicit value "
+        "to override.",
+    )
+    p.add_argument(
+        "--linear-backend",
+        default=None,
+        help="Force the linear-layer GEMM backend (e.g. cutlass, marlin, "
+        "flashinfer_cutlass). Default: vLLM auto-selects, except "
+        "when the CUDA toolkit is missing — then 'cutlass' is used "
+        "since FlashInfer backends JIT-compile with nvcc.",
+    )
+    p.add_argument(
+        "--moe-backend",
+        default=None,
+        help="Force the fused-MoE kernel backend (e.g. cutlass, marlin, "
+        "flashinfer_cutlass). Default: vLLM auto-selects, except "
+        "when the CUDA toolkit is missing — then 'cutlass' is used "
+        "since FlashInfer backends JIT-compile with nvcc.",
+    )
 
     # Performance
-    p.add_argument("--enforce-eager", action="store_true",
-                   help="Disable CUDA graph compilation (useful for debugging)")
-    p.add_argument("--enable-prefix-caching", action="store_true",
-                   help="Enable KV cache reuse across requests with shared prefixes")
+    p.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        help="Disable CUDA graph compilation (useful for debugging)",
+    )
+    p.add_argument(
+        "--enable-prefix-caching",
+        action="store_true",
+        help="Enable KV cache reuse across requests with shared prefixes",
+    )
 
     # Speculative decoding
-    p.add_argument("--speculative-config", default=None,
-                   help="JSON string or file path for speculative decoding config")
+    p.add_argument(
+        "--speculative-config",
+        default=None,
+        help="JSON string or file path for speculative decoding config",
+    )
 
     # Tool calling
-    p.add_argument("--tool-call-parser", default=None,
-                   help="Tool/function call parser (e.g. hermes, llama3_json, mistral)")
-    p.add_argument("--enable-auto-tool-choice", action="store_true",
-                   help="Let the model decide when to use tools (requires --tool-call-parser)")
+    p.add_argument(
+        "--tool-call-parser",
+        default=None,
+        help="Tool/function call parser (e.g. hermes, llama3_json, mistral)",
+    )
+    p.add_argument(
+        "--enable-auto-tool-choice",
+        action="store_true",
+        help="Let the model decide when to use tools (requires --tool-call-parser)",
+    )
 
     # Anything not recognized above is forwarded to vLLM as-is
     return p.parse_known_args()
@@ -102,8 +160,11 @@ def cuda_toolkit_available() -> bool:
     """
     if shutil.which("nvcc"):
         return True
-    candidates = (os.environ.get("CUDA_HOME"), os.environ.get("CUDA_PATH"),
-                  "/usr/local/cuda")
+    candidates = (
+        os.environ.get("CUDA_HOME"),
+        os.environ.get("CUDA_PATH"),
+        "/usr/local/cuda",
+    )
     return any(
         home and os.access(Path(home).expanduser() / "bin" / "nvcc", os.X_OK)
         for home in candidates
@@ -118,7 +179,10 @@ def main():
         model_path = Path(args.model).expanduser()
         if not model_path.exists():
             print(f"Error: model path '{args.model}' does not exist.", file=sys.stderr)
-            print("Run quantize.py first, or pass --model <path-or-HF-id>.", file=sys.stderr)
+            print(
+                "Run quantize.py first, or pass --model <path-or-HF-id>.",
+                file=sys.stderr,
+            )
             sys.exit(1)
         args.model = str(model_path)
 
@@ -135,16 +199,27 @@ def main():
         env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 
     cmd = [
-        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
-        "--model", args.model,
-        "--host", args.host,
-        "--port", str(args.port),
-        "--dtype", args.dtype,
-        "--max-model-len", str(args.max_model_len),
-        "--gpu-memory-utilization", str(args.gpu_memory_utilization),
-        "--kv-cache-dtype", args.kv_cache_dtype,
-        "--tensor-parallel-size", str(args.tensor_parallel_size),
-        "--pipeline-parallel-size", str(args.pipeline_parallel_size),
+        sys.executable,
+        "-m",
+        "vllm.entrypoints.openai.api_server",
+        "--model",
+        args.model,
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+        "--dtype",
+        args.dtype,
+        "--max-model-len",
+        str(args.max_model_len),
+        "--gpu-memory-utilization",
+        str(args.gpu_memory_utilization),
+        "--kv-cache-dtype",
+        args.kv_cache_dtype,
+        "--tensor-parallel-size",
+        str(args.tensor_parallel_size),
+        "--pipeline-parallel-size",
+        str(args.pipeline_parallel_size),
     ]
 
     if args.served_model_name:
@@ -175,17 +250,23 @@ def main():
 
     print(f"Model:   {args.model}")
     print(f"Port:    {args.port}")
-    print(f"GPU mem: {args.gpu_memory_utilization:.0%} of VRAM reserved for model + KV cache")
+    print(
+        f"GPU mem: {args.gpu_memory_utilization:.0%} of VRAM reserved for model + KV cache"
+    )
     print(f"URL:     http://localhost:{args.port}/v1")
     print()
-    print("Waiting for NVFP4 kernels to load and CUDA graphs to compile (~60s first run)...")
+    print(
+        "Waiting for NVFP4 kernels to load and CUDA graphs to compile (~60s first run)..."
+    )
     print("Look for: 'Using CutlassNvFp4LinearKernel for NVFP4 GEMM' (or another")
     print("optimized *NvFp4LinearKernel — a warning means it fell back to emulation).")
     print("Press Ctrl+C to stop.\n")
 
     if not have_nvcc:
-        print("Note: CUDA toolkit (nvcc) not found — using built-in CUTLASS "
-              "linear and MoE kernels and disabling the FlashInfer sampler.\n")
+        print(
+            "Note: CUDA toolkit (nvcc) not found — using built-in CUTLASS "
+            "linear and MoE kernels and disabling the FlashInfer sampler.\n"
+        )
 
     try:
         subprocess.run(cmd, env=env)

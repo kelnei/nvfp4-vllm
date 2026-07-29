@@ -10,8 +10,10 @@ than NVFP4 for a small size cost (~13% on a dense 12B, ~1% on a MoE).
 Usage:
     python quantize.py [--model MODEL_ID] [--output OUTPUT_DIR]
                        [--samples N] [--max-len N] [--weight-only]
-                       [--no-fp8-attn] [--ignore PATTERN ...] [--dtype TYPE]
-                       [--trust-remote-code] [--dataset DATASET] [--split SPLIT]
+                       [--no-fp8-attn] [--gptq-mlp {auto,on,off}]
+                       [--ignore PATTERN ...] [--dtype TYPE]
+                       [--trust-remote-code] [--dataset DATASET]
+                       [--split SPLIT]
 
 Defaults:
     model      = Qwen/Qwen2.5-0.5B-Instruct
@@ -21,6 +23,11 @@ Defaults:
     weight-only = False (W4A4; set flag for W4A16)
     fp8-attn   = True (FP8 attention + FP8 KV cache; the KV cache scale
                  needs calibration, so it is skipped with --weight-only)
+    gptq-mlp   = auto (GPTQ + imatrix_mse observer + static actorder on
+                 dense MLP gate/up/down projections; calibration-only, same
+                 on-disk format, ~20% lower KL vs BF16 than plain minmax.
+                 auto enables it for dense models and skips it for MoE,
+                 --weight-only, and --no-fp8-attn runs)
     ignore     = lm_head
     dtype      = auto
     dataset    = HuggingFaceH4/ultrachat_200k
@@ -42,7 +49,18 @@ from compressed_tensors.utils.safetensors_load import (
 )
 from datasets import load_dataset
 from llmcompressor import oneshot
+from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
+
+# llm-compressor 0.12.0 (current stable) only collects imatrix importance
+# statistics when an IMatrixGatherer is prepended to the recipe; without it,
+# observer=imatrix_mse silently falls back to a uniform MSE grid search.
+# Nightlies (0.12.1a+) remove the class and make the observer self-collecting,
+# so treat its absence as "no gatherer needed" rather than an error.
+try:
+    from llmcompressor.modifiers.transform.imatrix import IMatrixGatherer
+except ImportError:
+    IMatrixGatherer = None
 from transformers import (
     AutoModelForCausalLM,
     AutoProcessor,
@@ -60,6 +78,12 @@ FP8_ATTN_TARGET = r"re:.*self_attn\.(q|k|v|o)_proj$"
 # the FP8 shards as NVFP4. Matches nothing at quantization time, where the
 # projections are still unfused.
 FP8_ATTN_FUSED_TARGET = r"re:.*self_attn\.qkv_proj$"
+
+# Dense MLP projections given the GPTQ + imatrix_mse + actorder treatment by
+# --gptq-mlp. MoE expert projections (".mlp.experts.N.gate_proj") do not
+# match, deliberately: per-expert calibration coverage is too thin for
+# activation-statistics observers to be trustworthy there.
+GPTQ_MLP_TARGET = r"re:.*\.mlp\.(gate|up|down)_proj$"
 
 
 def _collect_tensor_meta(output_dir: Path) -> dict:
@@ -159,6 +183,21 @@ def parse_args():
         "uniform NVFP4.",
     )
     p.add_argument(
+        "--gptq-mlp",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Quantize dense MLP gate/up/down projections with GPTQ error "
+        "compensation (imatrix_mse observer + static activation ordering) "
+        "instead of plain minmax. Calibration-only change: same NVFP4 "
+        "on-disk format and serving cost, but ~20%% lower KL vs the BF16 "
+        "original (matches unsloth's NVFP4 checkpoints; plain minmax and "
+        "scale-only imatrix both measure no better than each other). "
+        "'auto' (default) enables it for dense models and skips it for MoE "
+        "(per-expert calibration coverage is too thin), --weight-only, and "
+        "--no-fp8-attn runs. 'on' requires calibration data, --fp8-attn, "
+        "and a non-MoE model.",
+    )
+    p.add_argument(
         "--ignore",
         nargs="+",
         default=["lm_head"],
@@ -229,17 +268,29 @@ def main():
                 observer="static_minmax",
             )
         config_groups["group_1"] = attn_scheme
-    recipe = QuantizationModifier(
-        config_groups=config_groups,
-        ignore=args.ignore,
-        kv_cache_scheme=kv_cache_scheme,
-    )
+    gptq_mlp = args.gptq_mlp
+    if gptq_mlp == "on":
+        if args.weight_only:
+            raise SystemExit(
+                "--gptq-mlp on needs calibration data to collect activation "
+                "statistics; it cannot be combined with --weight-only."
+            )
+        if not args.fp8_attn:
+            raise SystemExit(
+                "--gptq-mlp on moves the MLP projections into a GPTQ modifier "
+                "and drops the catch-all NVFP4 Linear group, so it needs "
+                "--fp8-attn to cover the attention projections."
+            )
+    elif gptq_mlp == "auto" and (args.weight_only or not args.fp8_attn):
+        gptq_mlp = "off"
 
     mode = "W4A16 (weight-only)" if args.weight_only else "W4A4 (weights + activations)"
     if args.fp8_attn:
         mode += " + FP8 attention"
     if kv_cache_scheme is not None:
         mode += " + FP8 KV cache"
+    if gptq_mlp == "on":
+        mode += " + GPTQ MLP"
 
     print(f"Model:       {model_id}")
     print(f"Mode:        {mode}")
@@ -269,6 +320,93 @@ def main():
             "architecture likely fuses QKV or uses MLA naming. Rerun with "
             "--no-fp8-attn or adjust FP8_ATTN_TARGET."
         )
+
+    # --gptq-mlp needs the live module tree: auto skips MoE models, and the
+    # recipe with GPTQ drops the catch-all Linear group, which would leave
+    # MoE expert projections unquantized entirely.
+    if gptq_mlp != "off":
+        module_names = [name for name, _ in model.named_modules()]
+        has_dense_mlp = any(match_name(n, GPTQ_MLP_TARGET) for n in module_names)
+        is_moe = any(n.endswith(".experts") or ".experts." in n for n in module_names)
+        if gptq_mlp == "auto":
+            if is_moe:
+                print(
+                    "GPTQ MLP:    auto -> skipped (MoE experts detected; "
+                    "per-expert calibration coverage is too thin)"
+                )
+                gptq_mlp = "off"
+            elif not has_dense_mlp:
+                print(
+                    "GPTQ MLP:    auto -> skipped (no modules match "
+                    f"{GPTQ_MLP_TARGET!r})"
+                )
+                gptq_mlp = "off"
+            else:
+                print("GPTQ MLP:    auto -> enabled (dense MLP projections)")
+                gptq_mlp = "on"
+        else:
+            if is_moe:
+                raise SystemExit(
+                    "--gptq-mlp on drops the catch-all NVFP4 Linear group, "
+                    "which would leave this model's MoE expert projections "
+                    "unquantized. Use --gptq-mlp auto or off for MoE models."
+                )
+            if not has_dense_mlp:
+                raise SystemExit(
+                    f"--gptq-mlp on matched no modules ({GPTQ_MLP_TARGET!r}); "
+                    "this architecture names its MLP projections differently. "
+                    "Rerun with --gptq-mlp off or adjust GPTQ_MLP_TARGET."
+                )
+
+    if gptq_mlp == "on":
+        # GPTQ error compensation is what actually delivers the KL gain — a
+        # plain QuantizationModifier with observer=imatrix_mse only refines
+        # group scales and measures no better than minmax (verified by paired
+        # per-token KL vs BF16 on gemma-4-12B, 2026-07-29). GPTQ owns the MLP
+        # projections; the catch-all Linear group is dropped so the two
+        # modifiers never claim the same module (matching the group layout of
+        # NVIDIA/unsloth NVFP4 checkpoints).
+        del config_groups["group_0"]
+        mlp_scheme = preset_name_to_scheme(scheme, [GPTQ_MLP_TARGET])
+        mlp_scheme.weights.observer = "imatrix_mse"
+        mlp_scheme.weights.actorder = "static"
+        recipe = [
+            QuantizationModifier(
+                config_groups=config_groups,
+                ignore=args.ignore,
+                kv_cache_scheme=kv_cache_scheme,
+            ),
+            GPTQModifier(
+                config_groups={"group_2": mlp_scheme},
+                ignore=args.ignore,
+            ),
+        ]
+        if IMatrixGatherer is not None:
+            # llm-compressor 0.12.0 only collects imatrix importance stats
+            # when the gatherer runs first; nightlies self-collect (the class
+            # is gone there, hence the guarded import).
+            recipe.insert(
+                0, IMatrixGatherer(targets=[GPTQ_MLP_TARGET], ignore=args.ignore)
+            )
+    else:
+        recipe = QuantizationModifier(
+            config_groups=config_groups,
+            ignore=args.ignore,
+            kv_cache_scheme=kv_cache_scheme,
+        )
+
+    # compressed-tensors initializes KV cache scales from the top-level model
+    # config, but multimodal configs (e.g. Gemma 4) nest the attention geometry
+    # inside text_config. Mirror the attributes it reads onto the top-level
+    # config, and drop them after quantization so they don't leak into the
+    # saved config.json.
+    kv_shim_attrs = []
+    text_config = model.config.get_text_config()
+    if kv_cache_scheme is not None and text_config is not model.config:
+        for attr in ("num_attention_heads", "num_key_value_heads", "head_dim"):
+            if not hasattr(model.config, attr) and hasattr(text_config, attr):
+                setattr(model.config, attr, getattr(text_config, attr))
+                kv_shim_attrs.append(attr)
 
     if args.weight_only:
         print("Running weight-only quantization (no calibration data needed)...")
@@ -321,6 +459,9 @@ def main():
             max_seq_length=args.max_len,
             num_calibration_samples=args.samples,
         )
+
+    for attr in kv_shim_attrs:
+        delattr(model.config, attr)
 
     print(f"\nSaving quantized model to ./{output_dir} ...")
     model.save_pretrained(output_dir, save_compressed=True)

@@ -28,6 +28,13 @@ default (and, for W4A4, calibrates an FP8 KV cache scale) — FP8 attention is
 ~3.5x closer to the original weights than NVFP4 for a small size cost. Pass
 `--no-fp8-attn` for uniform NVFP4.
 
+For W4A4 on dense models, the MLP gate/up/down projections are additionally
+quantized with GPTQ error compensation by default (`--gptq-mlp auto`) — a
+calibration-only change with the same on-disk format and serving cost that
+measures ~20% lower KL divergence vs the BF16 original than plain minmax.
+MoE models are skipped automatically (per-expert calibration coverage is too
+thin); pass `--gptq-mlp off` to disable.
+
 **Hardware requirement:** Blackwell GPUs (SM 12.0+). On older architectures vLLM falls
 back to weight-only dequantization, losing most of the speedup.
 

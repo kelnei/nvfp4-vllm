@@ -49,6 +49,7 @@ python chat.py
 | `--max-len` | `512` | Max tokens per calibration sample |
 | `--weight-only` | off | W4A16 mode (no calibration data needed) |
 | `--fp8-attn` | on | Keep attention q/k/v/o projections at FP8 and calibrate an FP8 KV cache scale (KV scale skipped with `--weight-only`); disable with `--no-fp8-attn` for uniform NVFP4 |
+| `--gptq-mlp` | `auto` | Quantize dense MLP gate/up/down projections with GPTQ error compensation (imatrix_mse observer + static actorder): same on-disk format and serving cost, ~20% lower KL vs the BF16 original. `auto` enables it for dense models and skips MoE, `--weight-only`, and `--no-fp8-attn` runs; `on`/`off` force it |
 | `--ignore` | `lm_head` | Layer names/regex patterns to exclude (use `re:` prefix for regex) |
 | `--dtype` | `auto` | Model dtype: auto, bfloat16, float16 |
 | `--trust-remote-code` | off | Trust remote code when loading model/tokenizer |

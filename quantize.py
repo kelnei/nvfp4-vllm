@@ -56,6 +56,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import torch
+from compressed_tensors.config import CompressionFormat
 from compressed_tensors.quantization import (
     QuantizationArgs,
     preset_name_to_scheme,
@@ -127,6 +128,14 @@ FP8_ATTN_FUSED_TARGET = r"re:.*self_attn\.qkv_proj$"
 # match, deliberately: per-expert calibration coverage is too thin for
 # activation-statistics observers to be trustworthy there.
 GPTQ_MLP_TARGET = r"re:.*\.mlp\.(gate|up|down)_proj$"
+
+# The Gemma-4 E-series per-layer embedding table, quantized to INT8 by
+# --int8-ple. It is a lookup table, not a matmul, so this is weight-only; vLLM
+# unpacks only the gathered rows (CompressedTensorsEmbeddingWNA16Int), which
+# makes the saving VRAM as well as disk. The trailing "_per_layer" keeps this
+# off the ordinary embed_tokens table, which is not a candidate: it is read
+# through lm_head, and lm_head is on the ignore list.
+PLE_TARGET = r"re:.*embed_tokens_per_layer$"
 
 
 # ---------------------------------------------------------------------------
@@ -1071,6 +1080,19 @@ def parse_args():
         help="Write the full --fp8-mlp sensitivity ranking to PATH as JSON.",
     )
     p.add_argument(
+        "--int8-ple",
+        choices=["auto", "on", "off"],
+        default="off",
+        help="Quantize the Gemma-4 E-series per-layer embedding table to "
+        "weight-only INT8, per vocab row ('auto' enables it wherever such a "
+        "table exists and is a no-op elsewhere; default: off). The table is a "
+        "third of an E-series checkpoint, so this takes ~30%% off E2B and "
+        "~26%% off E4B, in VRAM as well as on disk. It is off by default "
+        "because it is a real trade, not free: English chat is unaffected, but "
+        "under W4A4 it costs about 8%% KL on multilingual, tool-calling and "
+        "code prompts. See the Per-layer embeddings section of GUIDE.md.",
+    )
+    p.add_argument(
         "--ignore",
         nargs="+",
         default=["lm_head"],
@@ -1226,6 +1248,9 @@ def main():
         mode += " + GPTQ MLP"
     if fp8_mlp_mode != "off":
         mode += f" + FP8 MLP fallback ({args.fp8_mlp})"
+    if args.int8_ple == "on":
+        # "auto" is reported once the module tree says whether it applies.
+        mode += " + INT8 PLE"
 
     print(f"Model:       {model_id}")
     print(f"Mode:        {mode}")
@@ -1332,6 +1357,35 @@ def main():
                     "Rerun with --gptq-mlp off or adjust GPTQ_MLP_TARGET."
                 )
 
+    # --int8-ple only applies to architectures carrying a per-layer embedding
+    # table (the Gemma-4 E-series). Resolve against the live module tree rather
+    # than a config flag so "auto" stays a no-op everywhere else.
+    ple_matches = (
+        {}
+        if args.int8_ple == "off"
+        else {
+            name: module
+            for name, module in model.named_modules()
+            if isinstance(module, torch.nn.Embedding)
+            and match_name(name, PLE_TARGET)
+            and not any(match_name(name, pattern) for pattern in args.ignore)
+        }
+    )
+    ple_modules = sorted(ple_matches)
+    if args.int8_ple == "on" and not ple_modules:
+        raise SystemExit(
+            f"--int8-ple on matched no embedding module ({PLE_TARGET!r}); only "
+            "the Gemma-4 E-series has a per-layer embedding table. Rerun with "
+            "--int8-ple off or auto."
+        )
+    if args.int8_ple == "auto" and not ple_modules:
+        print(f"INT8 PLE:    auto -> skipped (no {PLE_TARGET!r} module)")
+    elif ple_modules:
+        # BF16 -> INT8 halves the table; the per-row scales are one BF16 value
+        # per vocab entry, which rounds to nothing beside it.
+        saved = sum(m.weight.nbytes for m in ple_matches.values()) // 2
+        print(f"INT8 PLE:    {', '.join(ple_modules)} (-{saved / 1024**2:.0f} MiB)")
+
     # Every dense MLP projection the NVFP4 recipe would claim, enumerated from
     # the live module tree. --fp8-mlp needs to split this set into two disjoint
     # explicit target lists: when two groups both match a module the winner is
@@ -1424,6 +1478,25 @@ def main():
         if args.weight_only:
             fp8_mlp_scheme.input_activations = None
         config_groups["group_3"] = fp8_mlp_scheme
+
+    if ple_modules:
+        # Weight-only: an embedding is a gather, not a matmul, so there is no
+        # input activation to quantize. The INT8 preset is already per-channel
+        # (one scale per vocab row) symmetric minmax, which is what vLLM's
+        # embedding kernel expects -- it rejects anything but weight-only INT
+        # group/channel.
+        ple_scheme = preset_name_to_scheme("INT8", ple_modules)
+        ple_scheme.input_activations = None
+        # Name the format instead of letting compressed-tensors infer it.
+        # infer_module_format() gates on `type(module) in (Linear, Embedding)`,
+        # an identity test that a subclass fails -- and Gemma 4's table is a
+        # Gemma4TextScaledWordEmbedding. Inference would fall through to
+        # `dense` and silently save the table uncompressed, at full BF16 size,
+        # while the scales alongside it made it look quantized. Setting
+        # scheme.format takes priority over inference (compressors/base.py
+        # compress_module), and nothing downstream re-checks the module type.
+        ple_scheme.format = CompressionFormat.pack_quantized.value
+        config_groups["group_4"] = ple_scheme
 
     if gptq_mlp == "on":
         # GPTQ error compensation is what actually delivers the KL gain — a

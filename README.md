@@ -54,6 +54,7 @@ python chat.py
 | `--sensitivity-dataset` | `ultrachat` | Data the `--fp8-mlp` ranking is measured on. Deliberately not the same default as `--dataset`: ranking layers on the wide mixture [picks measurably worse layers](GUIDE.md#why-the-scan-uses-a-different-corpus-than-calibration) |
 | `--sensitivity-samples` | `64` | Calibration samples the `--fp8-mlp` ranking measures KL over |
 | `--sensitivity-report` | none | Write the full `--fp8-mlp` ranking to a path as JSON |
+| `--int8-ple` | `off` | Quantize the Gemma-4 E-series per-layer embedding table to weight-only INT8, taking ~30% off an E2B checkpoint in VRAM as well as on disk. Off by default because it is [a real trade](GUIDE.md#per-layer-embeddings-gemma-4-e-series): free on English chat, ~8% KL on multilingual/tool/code prompts under W4A4 |
 | `--ignore` | `lm_head` | Layer names/regex patterns to exclude (use `re:` prefix for regex) |
 | `--pipeline` | `auto` | Calibration pipeline. `basic` runs plain full-model forwards — needed for architectures the sequential tracer cannot split into per-layer subgraphs (e.g. gemma-4 E-series shared-KV lookups) |
 | `--dtype` | `auto` | Model dtype: auto, bfloat16, float16 |

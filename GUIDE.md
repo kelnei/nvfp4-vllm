@@ -307,6 +307,57 @@ coverage is free.
 Set them equal if you have a reason to (`--sensitivity-dataset mix`), and the
 run builds one corpus instead of two.
 
+### Per-layer embeddings (Gemma 4 E-series)
+
+The E-series carries a second embedding table, `embed_tokens_per_layer`, that
+supplies a per-layer vector for every vocab entry. It is enormous relative to
+the rest of the model — 4.38 GB of a 7.34 GB E2B checkpoint, 5.25 GB on E4B —
+and the NVFP4 recipe leaves it at BF16, because it is a lookup table rather
+than a matmul.
+
+`--int8-ple on` quantizes it to weight-only INT8 with one scale per vocab row:
+
+| | E2B disk | E2B VRAM |
+|---|---|---|
+| BF16 table (default) | 7545 MB | 7.72 GiB |
+| `--int8-ple on` | 5305 MB | 5.53 GiB |
+
+The VRAM figure matters as much as the disk one. vLLM's
+`CompressedTensorsEmbeddingWNA16Int` unpacks only the rows a batch actually
+gathers, so the table stays packed in memory instead of being densified at
+load. Nothing else in the recipe changes, and the checkpoint serves on the
+usual `CutlassNvFp4LinearKernel`.
+
+**It is off by default because it is a real trade.** Measured on gemma-4-E2B
+with both arms derived from one checkpoint, so that exactly one tensor of 2324
+differs and GPTQ's non-reproducibility cannot contaminate the comparison:
+
+| | weight-only | emulated (W4A4) |
+|---|---|---|
+| english chat | -0.0001 `[-.0005,+.0003]` | +0.0003 `[-.0050,+.0054]` |
+| multilingual / tools / code | -0.0001 `[-.0006,+.0003]` | **+0.0080** `[+.0022,+.0135]` |
+
+Three cells are nulls. The fourth is not: under W4A4 the broad set pays about
+8% relative KL (0.0993 -> 0.1073). That comparison is exact, not approximate —
+re-running the identical checkpoint twice reproduces bit-identical per-token KL,
+so the measurement has no noise floor to hide behind.
+
+Two things worth knowing about that number:
+
+- **A weight-error proxy will not find it.** Quantizing the table perturbs it by
+  1.1% relative Frobenius error, and ablating it in isolation against a BF16
+  model costs 0.0008 KL — under 2% of what the recipe already spends, on both
+  prompt sets equally. The damage only appears once activations are also
+  quantized, which an isolated ablation cannot see by construction. Measure the
+  finished checkpoint in emulated mode or you will conclude this is free.
+- **It explains a gap we had attributed elsewhere.** unsloth's E2B ships the
+  same INT8 table, and our BF16-table checkpoint measured 0.0091 better than
+  theirs on broad/emulated. Turning this flag on lands us at 0.10730 against
+  their 0.10748 — essentially all of that advantage was the table.
+
+So: take it when 2.2 GB matters more than non-English fidelity, or when serving
+English chat, where it costs nothing measurable. Leave it off otherwise.
+
 ### Multimodal models (Gemma 4, etc.)
 
 Models with vision/audio components need those layers excluded from quantization,
@@ -379,6 +430,7 @@ The original FP16 model is ~950 MB — roughly 2× smaller for W4A4.
 | `--sensitivity-dataset` | `ultrachat` | Data the `--fp8-mlp` ranking is measured on. Defaults differently from `--dataset` deliberately — see [Mixed-precision MLP](#mixed-precision-mlp) |
 | `--sensitivity-samples` | `64` | Calibration samples the `--fp8-mlp` ranking measures KL over |
 | `--sensitivity-report` | none | Write the full `--fp8-mlp` ranking to a path as JSON |
+| `--int8-ple` | `off` | INT8 the Gemma-4 E-series per-layer embedding table: ~30% smaller, at a measured cost to non-English fidelity. See [Per-layer embeddings](#per-layer-embeddings-gemma-4-e-series) |
 | `--ignore` | `lm_head` | Layer names/regex patterns to exclude (use `re:` prefix for regex) |
 | `--pipeline` | `auto` | Calibration pipeline: `auto`, `sequential`, or `basic`. See [Untraceable architectures](#untraceable-architectures) |
 | `--dtype` | `auto` | Model dtype: auto, bfloat16, float16 |

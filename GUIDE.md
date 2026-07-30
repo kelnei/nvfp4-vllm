@@ -156,6 +156,11 @@ HuggingFace dataset ID still works as a single-source mixture (rows with a
 and `article` columns are also recognised, and oversized rows are split into
 `--max-len` chunks rather than truncated).
 
+This flag sets the corpus used for *calibration*. The `--fp8-mlp` sensitivity
+ranking draws from `--sensitivity-dataset` instead, which defaults to
+`ultrachat` for a measured reason — see
+[Mixed-precision MLP](#mixed-precision-mlp).
+
 **Vision.** For a checkpoint with an image processor, 12.5% of the samples come
 from [`unsloth/llava-instruct-mix-vsft-mini`](https://huggingface.co/datasets/unsloth/llava-instruct-mix-vsft-mini)
 as real image+text turns, pushed through the model's own processor. The vision
@@ -223,7 +228,7 @@ of them arbitrarily. The promoted layers are written to their own config group
 targeted by exact module name, and the NVFP4 group's targets are narrowed to
 the complement — two disjoint lists, so no module can match both groups.
 
-Three things worth knowing before trusting the ranking:
+Four things worth knowing before trusting the ranking:
 
 - **Per-layer KL does not add up.** Quantization errors in different layers
   interact, so the top N by marginal KL is a greedy pick, not a proven-optimal
@@ -234,17 +239,73 @@ Three things worth knowing before trusting the ranking:
 - **It costs forward passes.** Two per layer per sample, plus one reference
   pass. Lower `--sensitivity-samples` (default 64) to trade resolution between
   close-scoring layers for scan time.
-- **The ranking depends on `--dataset`.** Scanning gemma-4-E2B on the `mix`
-  corpus and on ultrachat alone agrees on only 8 of the top 12 layers
-  (Spearman ρ = 0.67 across all 35). The mix pushes the earliest layers far up
-  the ranking — layer 0 goes from 18th on ultrachat to 1st — which is what you
-  would expect when image embeddings and non-English text are spliced into the
-  input, since that is where those distributions differ most from plain
-  English chat. Scan on the data you intend to serve, and prefer the corpus you
-  are going to calibrate with.
+- **The ranking corpus is not the calibration corpus.** This is why
+  `--sensitivity-dataset` exists and defaults to `ultrachat` while `--dataset`
+  defaults to `mix`. Ranking on the wide mixture instead gives back about a
+  third of what the feature buys (31-39% across four measurements) — see below.
 
 `--fp8-mlp` needs calibration data for `scan` and `top:N`, so neither combines
 with `--weight-only`; an explicit layer list works in either mode.
+
+#### Why the scan uses a different corpus than calibration
+
+`--dataset` defaults to `mix` for coverage: activation scales and GPTQ should
+see code, math, tool calls, images and 18 languages, not just English chat.
+`--sensitivity-dataset` defaults to `ultrachat` anyway, because ranking layers
+on the wide mixture measurably picks worse layers.
+
+Scanning gemma-4-E2B both ways produces two nearly disjoint pictures of the
+same model. Ultrachat blames the middle of the stack; the mix blames the input
+side, moving layer 2 from 35th (dead last, gain 0.00014) to 6th (0.02198):
+
+```
+ultrachat  top-12: [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 23, 24]
+mix        top-12: [0, 1, 2, 4, 5, 6, 7, 8, 9, 11, 12, 13]     (Spearman ρ = 0.59)
+```
+
+Four gemma-4-E2B checkpoints, same recipe and ignore list throughout, measured
+as KL against the BF16 original on 30 English instruction prompts and on 30
+broad prompts (posed in ten languages, plus tool use, code and encyclopedic
+prose). Lower is better; `wo` is weight-only, `em` keeps activation fake-quant:
+
+| calibrated on | ranked on | english wo | english em | broad wo | broad em | size |
+|---|---|---|---|---|---|---|
+| ultrachat | — *(uniform NVFP4)* | 0.0648 | 0.1502 | 0.0668 | 0.1434 | 7367 MB |
+| ultrachat | ultrachat | **0.0455** | **0.0985** | 0.0496 | 0.0983 | 7545 MB |
+| mix | mix | 0.0574 | 0.1250 | 0.0520 | 0.1131 | 7509 MB |
+| mix | ultrachat *(default)* | 0.0527 | 0.1101 | **0.0452** | **0.0964** | 7545 MB |
+
+Rows 3 and 4 differ *only* in the ranking corpus, which is the clean test.
+Ranking on ultrachat wins all four measurements, every confidence interval
+excluding zero (paired by-prompt bootstrap: −0.0047 [−0.0071, −0.0024] and
+−0.0149 [−0.0256, −0.0058] on english, −0.0068 [−0.0087, −0.0048] and −0.0167
+[−0.0234, −0.0102] on broad). It wins on the broad set too — the one built
+specifically to give the wide mixture its best case.
+
+Rows 2 and 4 show the other half of the trade, and why `--dataset` still
+defaults to `mix`: calibrating on the mixture costs a little English chat
+fidelity and buys more back everywhere else. Row 4 is the best broad-domain
+checkpoint of the four, and beats unsloth's own E2B on both broad measures
+(−0.0074 [−0.0121, −0.0031] and −0.0111 [−0.0189, −0.0043]) while trailing it
+slightly on English.
+
+The obvious suspect is the 12.5% image turns pulling the input side up, but
+that is not it: rescanning the mix with `--vision-samples 0` barely moves the
+ranking (ρ = 0.948 against the mix scan, still 0.64 against ultrachat). The
+text mixture itself does it.
+
+The likely reason is that the scan and the metric look at different ends of the
+model. A diverse corpus differs from chat mostly in its *inputs* — languages,
+raw web text, code — so it stresses the layers nearest the embedding. But KL is
+measured over *output* positions, and the model answers in much the same
+assistant register whatever went in. Ranking layers by input diversity spends
+the FP8 budget where the divergence is not being scored. So the corpus to rank
+on is the one that looks like what the model emits, which for an instruct
+checkpoint is chat — while calibration still gets the wider mixture, where
+coverage is free.
+
+Set them equal if you have a reason to (`--sensitivity-dataset mix`), and the
+run builds one corpus instead of two.
 
 ### Multimodal models (Gemma 4, etc.)
 
@@ -315,6 +376,7 @@ The original FP16 model is ~950 MB — roughly 2× smaller for W4A4.
 | `--max-len` | `1024` | Max tokens per calibration sample |
 | `--weight-only` | off | Use W4A16 instead of W4A4 |
 | `--fp8-mlp` | `off` | Keep the most quantization-sensitive MLP layers at FP8. See [Mixed-precision MLP](#mixed-precision-mlp) |
+| `--sensitivity-dataset` | `ultrachat` | Data the `--fp8-mlp` ranking is measured on. Defaults differently from `--dataset` deliberately — see [Mixed-precision MLP](#mixed-precision-mlp) |
 | `--sensitivity-samples` | `64` | Calibration samples the `--fp8-mlp` ranking measures KL over |
 | `--sensitivity-report` | none | Write the full `--fp8-mlp` ranking to a path as JSON |
 | `--ignore` | `lm_head` | Layer names/regex patterns to exclude (use `re:` prefix for regex) |

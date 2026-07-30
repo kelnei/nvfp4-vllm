@@ -451,6 +451,65 @@ def build_calibration_loader(samples: list[dict], seed: int = 42) -> DataLoader:
     return DataLoader(shuffled, batch_size=1, collate_fn=_collate_single)
 
 
+def build_dataset(args, dataset: str, label: str, tokenizer, processor) -> DataLoader:
+    """Assemble one named mixture (or bare HF dataset id) into a DataLoader.
+
+    Called once for the calibration corpus and, when they differ, again for the
+    --fp8-mlp ranking corpus.
+    """
+    print(f"Loading {label.lower()} dataset ({dataset})...")
+
+    sources = CALIBRATION_MIXES.get(dataset)
+    if sources is None:
+        # Any HuggingFace dataset id still works as a single-source mix.
+        # ultrachat names its split "train_sft"; most datasets use "train".
+        default_split = (
+            "train_sft" if dataset == "HuggingFaceH4/ultrachat_200k" else "train"
+        )
+        sources = (
+            MixSource(dataset, "custom", 1.0, split=args.split or default_split),
+        )
+    elif args.split:
+        if len(sources) == 1:
+            sources = (sources[0]._replace(split=args.split),)
+        else:
+            print(f"  note: --split {args.split} ignored for mixture {dataset}")
+
+    n_vision = args.vision_samples
+    if n_vision == "auto":
+        has_image_processor = processor is not None and (
+            getattr(processor, "image_processor", None) is not None
+        )
+        n_vision = round(args.samples * VISION_FRACTION) if has_image_processor else 0
+    elif n_vision > 0 and processor is None:
+        raise SystemExit(
+            "--vision-samples needs an image processor, but "
+            "AutoProcessor.from_pretrained() returned none."
+        )
+
+    samples: list[dict] = []
+    counts: dict[str, int] = {}
+    if n_vision > 0:
+        vision_samples, vision_counts = build_vision_samples(
+            VISION_MIX, n_vision, processor, args.max_len
+        )
+        samples += vision_samples
+        counts.update(vision_counts)
+    text_samples, text_counts = build_text_samples(
+        sources, args.samples - len(samples), tokenizer, args.max_len
+    )
+    samples += text_samples
+    counts.update(text_counts)
+
+    if not samples:
+        raise SystemExit(f"Calibration mixture {dataset!r} yielded no samples")
+
+    total_tokens = sum(s["input_ids"].shape[-1] for s in samples)
+    breakdown = ", ".join(f"{role} {n}" for role, n in counts.items())
+    print(f"{label} set: {len(samples)} samples, {total_tokens:,} tokens ({breakdown})")
+    return build_calibration_loader(samples)
+
+
 # ---------------------------------------------------------------------------
 # Mixed-precision MLP selection
 # ---------------------------------------------------------------------------
@@ -582,11 +641,14 @@ def scan_mlp_sensitivity(
     layer scored within 11% of every other, because relative weight error is
     mostly a property of how Gaussian a matrix is, not of what the layer does.
 
-    Two caveats on the ranking. Per-layer KL measured in isolation does not sum
-    to whole-model KL, since quantization errors in different layers interact,
-    so taking the top N is a greedy heuristic rather than an optimal subset.
-    And both formats are measured with plain minmax: GPTQ later claws back part
-    of the NVFP4 error on whatever stays at NVFP4, which this cannot model.
+    Three caveats on the ranking. Per-layer KL measured in isolation does not
+    sum to whole-model KL, since quantization errors in different layers
+    interact, so taking the top N is a greedy heuristic rather than an optimal
+    subset. Both formats are measured with plain minmax: GPTQ later claws back
+    part of the NVFP4 error on whatever stays at NVFP4, which this cannot model.
+    And the ranking is a property of the data it is measured on, which is why
+    --sensitivity-dataset exists and defaults to chat rather than to the wider
+    calibration mixture -- see GUIDE.md for the measurement behind that.
     """
     modules = dict(model.named_modules())
     layers: dict[str, list[str]] = {}
@@ -1035,6 +1097,15 @@ def parse_args():
         "any HuggingFace dataset id (default: mix)",
     )
     p.add_argument(
+        "--sensitivity-dataset",
+        default="ultrachat",
+        help="Data the --fp8-mlp ranking is measured on, same vocabulary of "
+        "values as --dataset (default: ultrachat). It defaults differently "
+        "from --dataset on purpose: the scan compares output distributions, "
+        "and a corpus chosen for input coverage ranks layers worse. See the "
+        "Mixed-precision MLP section of GUIDE.md.",
+    )
+    p.add_argument(
         "--vision-samples",
         default="auto",
         help="How many of --samples carry an image, for multimodal "
@@ -1141,9 +1212,9 @@ def main():
 
     if fp8_mlp_mode in ("scan", "top") and args.weight_only:
         raise SystemExit(
-            "--fp8-mlp scan and top:N rank layers by their activation-weighted "
-            "quantization error, which needs the calibration pass --weight-only "
-            "skips. Pass an explicit layer list instead."
+            "--fp8-mlp scan and top:N rank layers by running data through the "
+            "model, which needs the calibration pass --weight-only skips. Pass "
+            "an explicit layer list instead."
         )
 
     mode = "W4A16 (weight-only)" if args.weight_only else "W4A4 (weights + activations)"
@@ -1164,6 +1235,8 @@ def main():
     if not args.weight_only:
         print(f"Calibration: {args.samples} samples, max {args.max_len} tokens each")
         print(f"Dataset:     {args.dataset}")
+        if fp8_mlp_mode in ("scan", "top"):
+            print(f"Ranked on:   {args.sensitivity_dataset}")
         if args.vision_samples != "auto":
             try:
                 args.vision_samples = int(args.vision_samples)
@@ -1276,68 +1349,15 @@ def main():
     # data through the unquantized model, and that ranking sets recipe targets.
     ds = None
     if not args.weight_only:
-        print(f"Loading calibration dataset ({args.dataset})...")
+        ds = build_dataset(args, args.dataset, "Calibration", tokenizer, processor)
 
-        sources = CALIBRATION_MIXES.get(args.dataset)
-        if sources is None:
-            # Any HuggingFace dataset id still works as a single-source mix.
-            # ultrachat names its split "train_sft"; most datasets use "train".
-            default_split = (
-                "train_sft"
-                if args.dataset == "HuggingFaceH4/ultrachat_200k"
-                else "train"
-            )
-            sources = (
-                MixSource(
-                    args.dataset, "custom", 1.0, split=args.split or default_split
-                ),
-            )
-        elif args.split:
-            if len(sources) == 1:
-                sources = (sources[0]._replace(split=args.split),)
-            else:
-                print(
-                    f"  note: --split {args.split} ignored for mixture {args.dataset}"
-                )
-
-        n_vision = args.vision_samples
-        if n_vision == "auto":
-            has_image_processor = processor is not None and (
-                getattr(processor, "image_processor", None) is not None
-            )
-            n_vision = (
-                round(args.samples * VISION_FRACTION) if has_image_processor else 0
-            )
-        elif n_vision > 0 and processor is None:
-            raise SystemExit(
-                "--vision-samples needs an image processor, but "
-                f"AutoProcessor.from_pretrained({model_id!r}) returned none."
-            )
-
-        samples: list[dict] = []
-        counts: dict[str, int] = {}
-        if n_vision > 0:
-            vision_samples, vision_counts = build_vision_samples(
-                VISION_MIX, n_vision, processor, args.max_len
-            )
-            samples += vision_samples
-            counts.update(vision_counts)
-        text_samples, text_counts = build_text_samples(
-            sources, args.samples - len(samples), tokenizer, args.max_len
+    # The ranking corpus is deliberately separate from the calibration corpus;
+    # see --sensitivity-dataset for why they default differently.
+    scan_ds = ds
+    if fp8_mlp_mode in ("scan", "top") and args.sensitivity_dataset != args.dataset:
+        scan_ds = build_dataset(
+            args, args.sensitivity_dataset, "Sensitivity", tokenizer, processor
         )
-        samples += text_samples
-        counts.update(text_counts)
-
-        if not samples:
-            raise SystemExit(f"Calibration mixture {args.dataset!r} yielded no samples")
-
-        total_tokens = sum(s["input_ids"].shape[-1] for s in samples)
-        breakdown = ", ".join(f"{role} {n}" for role, n in counts.items())
-        print(
-            f"Calibration set: {len(samples)} samples, {total_tokens:,} tokens "
-            f"({breakdown})"
-        )
-        ds = build_calibration_loader(samples)
 
     fp8_mlp_modules: list[str] = []
     if fp8_mlp_mode != "off":
@@ -1362,7 +1382,7 @@ def main():
         else:
             ranking = scan_mlp_sensitivity(
                 model,
-                ds,
+                scan_ds,
                 mlp_modules,
                 preset_name_to_scheme("NVFP4", ["Linear"]).weights,
                 preset_name_to_scheme("FP8_DYNAMIC", ["Linear"]).weights,

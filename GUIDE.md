@@ -508,6 +508,46 @@ matches against those when reloading the checkpoint itself. No manual
 python -c "from pathlib import Path; from quantize import fix_ignore_list; fix_ignore_list(Path('./your-model-NVFP4'))"
 ```
 
+### KV cache scales land on vision and audio towers
+Symptom at `vllm serve` time, on a multimodal checkpoint quantized with FP8 KV
+cache (the default):
+```
+ValueError: There is no module or parameter named
+'audio_tower.layers.0.self_attn.attn' in Gemma4ForConditionalGeneration
+```
+
+`self_attn.attn` is where vLLM keeps a layer's KV cache scales, and it only
+builds one for the decoder. The checkpoint has `k_scale`/`v_scale` saved for
+the audio (or vision) tower's attention as well, and there is nowhere to put
+them, so the load fails outright.
+
+Cause: compressed-tensors applies `kv_cache_scheme` by walking *every*
+attention module in the model and never consults the ignore list
+(`_apply_kv_cache_scheme`, 0.17.1), so passing
+`--ignore 're:model\.audio_tower\..*'` excludes the tower's Linear layers from
+quantization but not its attention from KV scaling.
+
+`quantize.py` now runs `strip_ignored_kv_scales()` before saving, dropping KV
+scales from any attention module the ignore patterns cover. The scales were
+inert — nothing reads them for a tower that is not KV-cached — so this changes
+nothing but loadability. To repair an older checkpoint without requantizing,
+delete the offending tensors and rewrite the shard:
+```bash
+python - <<'PY'
+import re
+from pathlib import Path
+from safetensors.torch import load_file, save_file
+path = Path("./your-model-NVFP4/model.safetensors")
+drop = re.compile(r"^model\.(audio_tower|vision_tower)\..*\.(k_scale|v_scale)$")
+tensors = load_file(path)
+kept = {k: v for k, v in tensors.items() if not drop.match(k)}
+print(f"removing {len(tensors) - len(kept)} tower KV scales")
+save_file(kept, path, metadata={"format": "pt"})
+PY
+```
+Sharded checkpoints additionally need the matching keys pruned from
+`model.safetensors.index.json`.
+
 ### Untraceable architectures
 Symptom during calibration:
 ```

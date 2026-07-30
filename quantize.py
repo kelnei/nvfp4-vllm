@@ -553,6 +553,48 @@ def preserve_dropped_tensors(model_id: str, output_dir: Path, model) -> None:
     )
 
 
+def strip_ignored_kv_scales(model, ignore: list[str]) -> None:
+    """Drop KV cache scales from attention modules the user asked to ignore.
+
+    compressed-tensors applies `kv_cache_scheme` by walking every attention
+    module in the model (`_apply_kv_cache_scheme`, 0.17.1) and never consults
+    the ignore list, so a multimodal checkpoint comes out with k_scale/v_scale
+    on its vision and audio towers as well as its decoder. vLLM only builds a
+    KV cache for the decoder, so those extra scales have no parameter to load
+    into and it refuses the whole checkpoint:
+
+        ValueError: There is no module or parameter named
+        'audio_tower.layers.0.self_attn.attn' in Gemma4ForConditionalGeneration
+
+    The scales are inert either way -- nothing reads them for a tower that
+    isn't KV-cached -- so dropping them before save costs nothing and is what
+    --ignore already means everywhere else.
+    """
+    stripped = []
+    for name, module in model.named_modules():
+        if not any(match_name(name, pattern) for pattern in ignore):
+            continue
+        removed = False
+        for attr in ("k_scale", "v_scale", "k_zero_point", "v_zero_point"):
+            if hasattr(module, attr):
+                delattr(module, attr)
+                removed = True
+        if removed:
+            # Leaving the scheme behind would make the compressor look for the
+            # parameters that were just removed. It has to be deleted rather
+            # than set to None: is_module_quantized() tests hasattr and then
+            # dereferences, so a None scheme raises instead of reading false.
+            if hasattr(module, "quantization_scheme"):
+                delattr(module, "quantization_scheme")
+            stripped.append(name)
+
+    if stripped:
+        print(
+            f"Dropped KV cache scales from {len(stripped)} ignored attention "
+            f"modules (e.g. {stripped[0]})."
+        )
+
+
 def fix_ignore_list(output_dir: Path, extra_ignore: list[str] | None = None) -> None:
     """
     llm-compressor records the quantization ignore list using the live
@@ -1034,6 +1076,9 @@ def main():
 
     for attr in kv_shim_attrs:
         delattr(model.config, attr)
+
+    if kv_cache_scheme is not None:
+        strip_ignored_kv_scales(model, args.ignore)
 
     print(f"\nSaving quantized model to ./{output_dir} ...")
     model.save_pretrained(output_dir, save_compressed=True)

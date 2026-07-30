@@ -45,8 +45,8 @@ python chat.py
 |------|---------|-------------|
 | `--model` | `Qwen/Qwen2.5-0.5B-Instruct` | HuggingFace model ID or local path |
 | `--output` | `<basename>-NVFP4` | Output directory |
-| `--samples` | `256` | Calibration samples (more = better accuracy) |
-| `--max-len` | `512` | Max tokens per calibration sample |
+| `--samples` | `512` | Calibration samples (more = better accuracy) |
+| `--max-len` | `1024` | Max tokens per calibration sample |
 | `--weight-only` | off | W4A16 mode (no calibration data needed) |
 | `--fp8-attn` | on | Keep attention q/k/v/o projections at FP8 and calibrate an FP8 KV cache scale (KV scale skipped with `--weight-only`); disable with `--no-fp8-attn` for uniform NVFP4 |
 | `--gptq-mlp` | `auto` | Quantize dense MLP gate/up/down projections with GPTQ error compensation (imatrix_mse observer + static actorder): same on-disk format and serving cost, ~20% lower KL vs the BF16 original. `auto` enables it for dense models and skips MoE, `--weight-only`, and `--no-fp8-attn` runs; `on`/`off` force it |
@@ -54,8 +54,9 @@ python chat.py
 | `--pipeline` | `auto` | Calibration pipeline. `basic` runs plain full-model forwards — needed for architectures the sequential tracer cannot split into per-layer subgraphs (e.g. gemma-4 E-series shared-KV lookups) |
 | `--dtype` | `auto` | Model dtype: auto, bfloat16, float16 |
 | `--trust-remote-code` | off | Trust remote code when loading model/tokenizer |
-| `--dataset` | `HuggingFaceH4/ultrachat_200k` | HuggingFace dataset for calibration |
-| `--split` | auto | Dataset split (`train_sft` for ultrachat, `train` otherwise) |
+| `--dataset` | `mix` | Calibration data: a [named mixture](GUIDE.md#calibration-data) (`mix`, `ultrachat`) or any HuggingFace dataset ID |
+| `--vision-samples` | `auto` | Share of `--samples` that carry an image. `auto` = 12.5% when the checkpoint has an image processor, 0 otherwise |
+| `--split` | auto | Dataset split (`train_sft` for ultrachat, `train` otherwise); ignored for multi-source mixtures |
 | `--cpu-offload` | off | Load model to system RAM; llm-compressor dispatches layers to GPU during calibration (use for large MoE models) |
 
 ### serve.py

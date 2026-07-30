@@ -3,9 +3,9 @@ Quantize a model to NVFP4 (W4A4) using llm-compressor.
 
 By default attention q/k/v/o projections are kept at FP8 (channel-wise
 weights, dynamic per-token activations) and an FP8 KV cache scale is
-calibrated, matching the mixed-precision layout used by NVIDIA/unsloth
-NVFP4 checkpoints. FP8 attention is ~3.5x closer to the original weights
-than NVFP4 for a small size cost (~13% on a dense 12B, ~1% on a MoE).
+calibrated — the mixed-precision layout vLLM's NVFP4 kernels expect. FP8
+attention is ~3.5x closer to the original weights than NVFP4 for a small
+size cost (~13% on a dense 12B, ~1% on a MoE).
 
 Usage:
     python quantize.py [--model MODEL_ID] [--output OUTPUT_DIR]
@@ -13,13 +13,13 @@ Usage:
                        [--no-fp8-attn] [--gptq-mlp {auto,on,off}]
                        [--ignore PATTERN ...] [--dtype TYPE]
                        [--trust-remote-code] [--dataset DATASET]
-                       [--split SPLIT]
+                       [--split SPLIT] [--vision-samples N]
 
 Defaults:
     model      = Qwen/Qwen2.5-0.5B-Instruct
     output     = <model-basename>-NVFP4
-    samples    = 256
-    max-len    = 512
+    samples    = 512
+    max-len    = 1024
     weight-only = False (W4A4; set flag for W4A16)
     fp8-attn   = True (FP8 attention + FP8 KV cache; the KV cache scale
                  needs calibration, so it is skipped with --weight-only)
@@ -30,13 +30,22 @@ Defaults:
                  --weight-only, and --no-fp8-attn runs)
     ignore     = lm_head
     dtype      = auto
-    dataset    = HuggingFaceH4/ultrachat_200k
-    split      = auto (train_sft for ultrachat, train otherwise)
+    dataset    = mix (chat + instruct + code + math + multilingual + tool
+                 calls + raw web text, streamed from seven HuggingFace
+                 datasets and rendered through the model's chat template;
+                 'ultrachat' selects the old single-source set, and any
+                 HuggingFace dataset id still works)
+    vision-samples = auto (12.5% of --samples carry an image when the
+                 checkpoint has an image processor, 0 otherwise)
+    split      = auto (train_sft for ultrachat, train otherwise; ignored for
+                 multi-source mixtures)
 """
 
 import argparse
 import json
+import random
 from pathlib import Path
+from typing import NamedTuple
 
 from compressed_tensors.quantization import (
     QuantizationArgs,
@@ -51,6 +60,7 @@ from datasets import load_dataset
 from llmcompressor import oneshot
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
+from torch.utils.data import DataLoader
 
 # llm-compressor 0.12.0 (current stable) only collects imatrix importance
 # statistics when an IMatrixGatherer is prepended to the recipe; without it,
@@ -106,6 +116,328 @@ FP8_ATTN_FUSED_TARGET = r"re:.*self_attn\.qkv_proj$"
 # match, deliberately: per-expert calibration coverage is too thin for
 # activation-statistics observers to be trustworthy there.
 GPTQ_MLP_TARGET = r"re:.*\.mlp\.(gate|up|down)_proj$"
+
+
+# ---------------------------------------------------------------------------
+# Calibration data
+# ---------------------------------------------------------------------------
+#
+# W4A4 fits activation scales to whatever text it is shown, so the corpus is
+# an accuracy knob rather than a formality. `mix` spreads that exposure across
+# what a served model actually sees: multi-turn chat, general instruction
+# following, code and math reasoning, tool calls, 65-language prompts, and raw
+# multilingual web text.
+#
+# Chat sources are rendered through the model's own chat template, which puts
+# the template's control tokens into the activation statistics -- an instruct
+# model calibrated on plain text never sees the format it is served in. The
+# raw-text component is the deliberate exception.
+#
+# Every source is read with streaming=True, so a run pulls only the rows it
+# samples rather than the whole repo (tulu-3 alone is 1.4 GB on disk).
+#
+# Note that on a 5B model, neither this mixture nor a 4.4x larger token budget
+# moved KL against the BF16 original by more than measurement noise; the case
+# for it is breadth of coverage, which an English-chat KL harness cannot see.
+
+
+class MixSource(NamedTuple):
+    """One component of a calibration mixture."""
+
+    id: str
+    role: str
+    weight: float
+    split: str = "train"
+    config: str | None = None
+    data_files: str | None = None
+
+
+TEXT_MIX: tuple[MixSource, ...] = (
+    MixSource("HuggingFaceH4/ultrachat_200k", "chat", 0.20, split="train_sft"),
+    MixSource("allenai/tulu-3-sft-mixture", "instruct", 0.15),
+    MixSource("open-r1/Mixture-of-Thoughts", "code", 0.12, config="code"),
+    MixSource("open-r1/Mixture-of-Thoughts", "math", 0.12, config="math"),
+    MixSource("CohereLabs/aya_dataset", "multilingual", 0.15),
+    MixSource("HuggingFaceTB/smoltalk", "tools", 0.10, config="apigen-80k"),
+    # Purpose-built imatrix calibration text: cleaned, de-duplicated FineWeb
+    # across 18 languages. Not chat-templated, deliberately -- it is the one
+    # component that exercises the model outside its instruct format.
+    MixSource(
+        "eaddario/imatrix-calibration",
+        "raw-text",
+        0.16,
+        data_files="text_all_small.parquet",
+    ),
+)
+
+# Image+text turns for multimodal checkpoints. The vision tower itself stays
+# unquantized, but its output embeddings are spliced into the decoder's input
+# sequence, and their distribution is nothing like a text embedding's -- so
+# without image samples the decoder's NVFP4 input scales and FP8 KV scales are
+# calibrated on half the input distribution the model actually sees.
+VISION_MIX: tuple[MixSource, ...] = (
+    MixSource("unsloth/llava-instruct-mix-vsft-mini", "vision", 1.0),
+)
+
+CALIBRATION_MIXES: dict[str, tuple[MixSource, ...]] = {
+    "mix": TEXT_MIX,
+    "ultrachat": (
+        MixSource("HuggingFaceH4/ultrachat_200k", "chat", 1.0, split="train_sft"),
+    ),
+}
+
+# Share of --samples given to image turns when --vision-samples is auto and
+# the checkpoint has an image processor.
+VISION_FRACTION = 0.125
+
+
+def _allocate(sources: tuple[MixSource, ...], total: int) -> list[int]:
+    """Split `total` samples across sources by weight (largest remainder)."""
+    if total <= 0:
+        return [0] * len(sources)
+    scale = sum(s.weight for s in sources) or 1.0
+    exact = [total * s.weight / scale for s in sources]
+    quotas = [int(x) for x in exact]
+    order = sorted(
+        range(len(sources)), key=lambda i: exact[i] - quotas[i], reverse=True
+    )
+    for i in order[: total - sum(quotas)]:
+        quotas[i] += 1
+    return quotas
+
+
+def _stream(src: MixSource, seed: int, buffer: int):
+    kwargs = {}
+    if src.config is not None:
+        kwargs["name"] = src.config
+    if src.data_files is not None:
+        kwargs["data_files"] = src.data_files
+    ds = load_dataset(src.id, split=src.split, streaming=True, **kwargs)
+    return ds.shuffle(seed=seed, buffer_size=buffer)
+
+
+def _row_to_messages(row: dict) -> list | None:
+    """Normalise a row to chat turns, or None if it is unstructured text."""
+    messages = row.get("messages")
+    if isinstance(messages, list) and messages:
+        return messages
+    # CohereLabs/aya_dataset: single-turn prompt/completion columns
+    if isinstance(row.get("inputs"), str) and isinstance(row.get("targets"), str):
+        return [
+            {"role": "user", "content": row["inputs"]},
+            {"role": "assistant", "content": row["targets"]},
+        ]
+    return None
+
+
+def _row_to_text(row: dict) -> str | None:
+    for key in ("content", "text", "article"):
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return next(
+        (v for v in row.values() if isinstance(v, str) and len(v.strip()) > 32), None
+    )
+
+
+def _render_chat(tokenizer, messages: list) -> str | None:
+    """Apply the chat template, folding a system turn into the first user turn
+    if the template rejects it (gemma's does)."""
+    try:
+        return tokenizer.apply_chat_template(messages, tokenize=False)
+    except Exception:
+        pass
+
+    folded: list[dict] = []
+    carried = ""
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, str):
+            return None
+        if message.get("role") == "system":
+            carried += content.strip() + "\n\n"
+            continue
+        if carried and message.get("role") == "user":
+            message = {**message, "content": carried + content}
+            carried = ""
+        folded.append(message)
+    if not folded:
+        return None
+    try:
+        return tokenizer.apply_chat_template(folded, tokenize=False)
+    except Exception:
+        return None
+
+
+def _chunk_text(text: str | None, max_len: int) -> list[str]:
+    """Split a raw-text row into chunks of roughly `max_len` tokens each.
+
+    Splits on line boundaries and budgets 3 characters per token, which
+    under-fills for English and over-fills for CJK; the tokenizer truncates
+    either way, so the only cost of being wrong is chunk size drift.
+    """
+    if not text:
+        return []
+    budget = 3 * max_len
+    if len(text) <= budget:
+        return [text]
+
+    chunks: list[str] = []
+    current: list[str] = []
+    size = 0
+    for line in text.splitlines(keepends=True):
+        current.append(line)
+        size += len(line)
+        if size >= budget:
+            chunks.append("".join(current))
+            current, size = [], 0
+    if size > budget // 4:
+        chunks.append("".join(current))
+    return chunks
+
+
+def build_text_samples(
+    sources: tuple[MixSource, ...],
+    total: int,
+    tokenizer,
+    max_len: int,
+    seed: int = 42,
+) -> tuple[list[dict], dict[str, int]]:
+    """Stream `total` tokenized samples from a weighted mixture of sources."""
+    samples: list[dict] = []
+    counts: dict[str, int] = {}
+
+    for src, quota in zip(sources, _allocate(sources, total)):
+        if quota <= 0:
+            continue
+        taken = 0
+        # Cap the scan so a source that keeps failing to render can't spin.
+        for scanned, row in enumerate(_stream(src, seed, max(512, quota * 4))):
+            if taken >= quota or scanned >= quota * 20 + 64:
+                break
+            messages = _row_to_messages(row)
+            if messages is not None:
+                rendered = _render_chat(tokenizer, messages)
+                texts = [rendered] if rendered else []
+                add_special_tokens = False
+            else:
+                # Corpus rows can be whole documents (eaddario ships each of
+                # its files as one multi-megabyte string), so split rather
+                # than truncate away 99% of the row.
+                texts = _chunk_text(_row_to_text(row), max_len)
+                # Chunks come out in document order; sample across the whole
+                # document instead of only its opening pages.
+                random.Random(seed).shuffle(texts)
+                add_special_tokens = True
+            for text in texts:
+                if taken >= quota:
+                    break
+                encoded = tokenizer(
+                    text,
+                    padding=False,
+                    truncation=True,
+                    max_length=max_len,
+                    add_special_tokens=add_special_tokens,
+                    return_tensors="pt",
+                )
+                if encoded["input_ids"].shape[-1] < 8:
+                    continue
+                samples.append(dict(encoded))
+                taken += 1
+        counts[src.role] = counts.get(src.role, 0) + taken
+        if taken < quota:
+            print(f"  warning: {src.id} yielded {taken}/{quota} usable samples")
+
+    return samples, counts
+
+
+def _vision_messages(row: dict) -> list | None:
+    """Rewrite a llava-style row into chat turns with inline PIL images."""
+    images = list(row.get("images") or [])
+    turns: list[dict] = []
+    for message in row.get("messages") or []:
+        content = []
+        for part in message.get("content") or []:
+            if part.get("type") == "image":
+                index = part.get("index") or 0
+                if index >= len(images):
+                    return None
+                content.append({"type": "image", "image": images[index]})
+            elif part.get("text"):
+                content.append({"type": "text", "text": part["text"]})
+        if content:
+            turns.append({"role": message["role"], "content": content})
+    return turns or None
+
+
+def build_vision_samples(
+    sources: tuple[MixSource, ...],
+    total: int,
+    processor,
+    max_len: int,
+    seed: int = 42,
+) -> tuple[list[dict], dict[str, int]]:
+    """Stream `total` image+text samples through the model's own processor.
+
+    Returns empty if the processor cannot render inline images -- a text-only
+    calibration set is a worse calibration set, not a failed run.
+    """
+    samples: list[dict] = []
+    counts: dict[str, int] = {}
+
+    for src, quota in zip(sources, _allocate(sources, total)):
+        if quota <= 0:
+            continue
+        taken = 0
+        for scanned, row in enumerate(_stream(src, seed, max(256, quota * 4))):
+            if taken >= quota or scanned >= quota * 10 + 32:
+                break
+            messages = _vision_messages(row)
+            if messages is None:
+                continue
+            try:
+                encoded = processor.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                    add_generation_prompt=False,
+                )
+            except Exception as exc:
+                print(
+                    f"  warning: {type(processor).__name__} cannot render inline "
+                    f"images ({exc}); calibrating on text only"
+                )
+                return [], {}
+            # Image placeholders must survive intact, so these are filtered on
+            # length rather than truncated.
+            if encoded["input_ids"].shape[-1] > 4 * max_len:
+                continue
+            samples.append(dict(encoded))
+            taken += 1
+        counts[src.role] = counts.get(src.role, 0) + taken
+        if taken < quota:
+            print(f"  warning: {src.id} yielded {taken}/{quota} usable samples")
+
+    return samples, counts
+
+
+def _collate_single(batch: list[dict]) -> dict:
+    # batch_size=1: text and image samples carry different keys, so there is
+    # nothing to stack. The processor/tokenizer already produced a batch dim.
+    assert len(batch) == 1
+    return batch[0]
+
+
+def build_calibration_loader(samples: list[dict], seed: int = 42) -> DataLoader:
+    """Shuffle the merged mixture and wrap it for llm-compressor.
+
+    oneshot() accepts a DataLoader directly, which is what lets one mixture
+    hold text-only and image-bearing samples with different key sets.
+    """
+    shuffled = list(samples)
+    random.Random(seed).shuffle(shuffled)
+    return DataLoader(shuffled, batch_size=1, collate_fn=_collate_single)
 
 
 def _collect_tensor_meta(output_dir: Path) -> dict:
@@ -290,13 +622,13 @@ def parse_args():
     p.add_argument(
         "--samples",
         type=int,
-        default=256,
+        default=512,
         help="Number of calibration samples (more = better accuracy)",
     )
     p.add_argument(
         "--max-len",
         type=int,
-        default=512,
+        default=1024,
         help="Max token length per calibration sample",
     )
     p.add_argument(
@@ -322,8 +654,8 @@ def parse_args():
         "compensation (imatrix_mse observer + static activation ordering) "
         "instead of plain minmax. Calibration-only change: same NVFP4 "
         "on-disk format and serving cost, but ~20%% lower KL vs the BF16 "
-        "original (matches unsloth's NVFP4 checkpoints; plain minmax and "
-        "scale-only imatrix both measure no better than each other). "
+        "original (plain minmax and scale-only imatrix both measure no "
+        "better than each other). "
         "'auto' (default) enables it for dense models and skips it for MoE "
         "(per-expert calibration coverage is too thin), --weight-only, and "
         "--no-fp8-attn runs. 'on' requires calibration data, --fp8-attn, "
@@ -348,14 +680,27 @@ def parse_args():
     )
     p.add_argument(
         "--dataset",
-        default="HuggingFaceH4/ultrachat_200k",
-        help="HuggingFace dataset for calibration (default: HuggingFaceH4/ultrachat_200k)",
+        default="mix",
+        help="Calibration data: a named mixture ('mix' = chat + instruct + "
+        "code + math + multilingual + tool calls + raw web text, streamed "
+        "from seven HuggingFace datasets and rendered through the model's "
+        "chat template; 'ultrachat' = HuggingFaceH4/ultrachat_200k alone) or "
+        "any HuggingFace dataset id (default: mix)",
+    )
+    p.add_argument(
+        "--vision-samples",
+        default="auto",
+        help="How many of --samples carry an image, for multimodal "
+        "checkpoints. 'auto' (default) uses 12.5%% when the checkpoint has an "
+        "image processor and 0 otherwise; pass an integer to override, or 0 "
+        "to calibrate on text only.",
     )
     p.add_argument(
         "--split",
         default=None,
         help="Dataset split for calibration (default: train_sft for "
-        "ultrachat_200k, train otherwise)",
+        "ultrachat_200k, train otherwise). Ignored for multi-source mixtures, "
+        "which pin their own splits.",
     )
     p.add_argument(
         "--pipeline",
@@ -443,6 +788,19 @@ def main():
     if not args.weight_only:
         print(f"Calibration: {args.samples} samples, max {args.max_len} tokens each")
         print(f"Dataset:     {args.dataset}")
+        if args.vision_samples != "auto":
+            try:
+                args.vision_samples = int(args.vision_samples)
+            except ValueError:
+                raise SystemExit(
+                    f"--vision-samples must be 'auto' or an integer, got "
+                    f"{args.vision_samples!r}"
+                ) from None
+            if not 0 <= args.vision_samples <= args.samples:
+                raise SystemExit(
+                    f"--vision-samples must be between 0 and --samples "
+                    f"({args.samples}), got {args.vision_samples}"
+                )
 
     print("\nLoading model...")
     load_kwargs = dict(dtype=args.dtype)
@@ -467,6 +825,17 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(
         model_id, trust_remote_code=args.trust_remote_code
     )
+    # For text-only models AutoProcessor just hands back the tokenizer. Loaded
+    # here rather than at save time because image calibration samples have to
+    # go through the model's own processor.
+    try:
+        processor = AutoProcessor.from_pretrained(
+            model_id, trust_remote_code=args.trust_remote_code
+        )
+    except Exception:
+        processor = None
+    if isinstance(processor, PreTrainedTokenizerBase):
+        processor = None
 
     if args.fp8_attn and not any(
         match_name(name, FP8_ATTN_TARGET) for name, _ in model.named_modules()
@@ -520,8 +889,7 @@ def main():
         # group scales and measures no better than minmax (verified by paired
         # per-token KL vs BF16 on gemma-4-12B, 2026-07-29). GPTQ owns the MLP
         # projections; the catch-all Linear group is dropped so the two
-        # modifiers never claim the same module (matching the group layout of
-        # NVIDIA/unsloth NVFP4 checkpoints).
+        # modifiers never claim the same module.
         del config_groups["group_0"]
         mlp_scheme = preset_name_to_scheme(scheme, [GPTQ_MLP_TARGET])
         mlp_scheme.weights.observer = "imatrix_mse"
@@ -580,42 +948,66 @@ def main():
     else:
         print(f"Loading calibration dataset ({args.dataset})...")
 
-        # ultrachat names its split "train_sft"; most datasets use "train"
-        split = args.split or (
-            "train_sft" if args.dataset == "HuggingFaceH4/ultrachat_200k" else "train"
-        )
-
-        ds = load_dataset(args.dataset, split=f"{split}[:{args.samples}]")
-        ds = ds.shuffle(seed=42)
-
-        def preprocess(example):
-            # Support datasets with "messages" (chat) or "text" (raw text) columns
-            if "messages" in example:
-                text = tokenizer.apply_chat_template(
-                    example["messages"], tokenize=False
-                )
-            elif "text" in example:
-                text = example["text"]
-            elif "article" in example:
-                text = example["article"]
+        sources = CALIBRATION_MIXES.get(args.dataset)
+        if sources is None:
+            # Any HuggingFace dataset id still works as a single-source mix.
+            # ultrachat names its split "train_sft"; most datasets use "train".
+            default_split = (
+                "train_sft"
+                if args.dataset == "HuggingFaceH4/ultrachat_200k"
+                else "train"
+            )
+            sources = (
+                MixSource(
+                    args.dataset, "custom", 1.0, split=args.split or default_split
+                ),
+            )
+        elif args.split:
+            if len(sources) == 1:
+                sources = (sources[0]._replace(split=args.split),)
             else:
-                # Fall back to first string column
-                text = next(
-                    v for v in example.values() if isinstance(v, str) and len(v) > 0
+                print(
+                    f"  note: --split {args.split} ignored for mixture {args.dataset}"
                 )
-            return {"text": text}
 
-        def tokenize(sample):
-            return tokenizer(
-                sample["text"],
-                padding=False,
-                max_length=args.max_len,
-                truncation=True,
-                add_special_tokens=False,
+        n_vision = args.vision_samples
+        if n_vision == "auto":
+            has_image_processor = processor is not None and (
+                getattr(processor, "image_processor", None) is not None
+            )
+            n_vision = (
+                round(args.samples * VISION_FRACTION) if has_image_processor else 0
+            )
+        elif n_vision > 0 and processor is None:
+            raise SystemExit(
+                "--vision-samples needs an image processor, but "
+                f"AutoProcessor.from_pretrained({model_id!r}) returned none."
             )
 
-        ds = ds.map(preprocess)
-        ds = ds.map(tokenize, remove_columns=ds.column_names)
+        samples: list[dict] = []
+        counts: dict[str, int] = {}
+        if n_vision > 0:
+            vision_samples, vision_counts = build_vision_samples(
+                VISION_MIX, n_vision, processor, args.max_len
+            )
+            samples += vision_samples
+            counts.update(vision_counts)
+        text_samples, text_counts = build_text_samples(
+            sources, args.samples - len(samples), tokenizer, args.max_len
+        )
+        samples += text_samples
+        counts.update(text_counts)
+
+        if not samples:
+            raise SystemExit(f"Calibration mixture {args.dataset!r} yielded no samples")
+
+        total_tokens = sum(s["input_ids"].shape[-1] for s in samples)
+        breakdown = ", ".join(f"{role} {n}" for role, n in counts.items())
+        print(
+            f"Calibration set: {len(samples)} samples, {total_tokens:,} tokens "
+            f"({breakdown})"
+        )
+        ds = build_calibration_loader(samples)
 
         oneshot_kwargs = {}
         if args.pipeline != "auto":
@@ -648,15 +1040,9 @@ def main():
     tokenizer.save_pretrained(output_dir)
 
     # Multimodal models (e.g. Gemma 4) need preprocessor_config.json for the
-    # vision/audio feature extractor. Save the processor if there is one
-    # (for text-only models AutoProcessor just returns the tokenizer again).
-    try:
-        processor = AutoProcessor.from_pretrained(
-            model_id, trust_remote_code=args.trust_remote_code
-        )
-    except Exception:
-        processor = None
-    if processor is not None and not isinstance(processor, PreTrainedTokenizerBase):
+    # vision/audio feature extractor. `processor` is None for text-only models,
+    # where AutoProcessor just returns the tokenizer again.
+    if processor is not None:
         processor.save_pretrained(output_dir)
         if hasattr(processor, "image_processor"):
             processor.image_processor.save_pretrained(output_dir)

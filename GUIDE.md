@@ -119,6 +119,60 @@ python quantize.py \
   --max-len 2048
 ```
 
+### Calibration data
+
+W4A4 quantization derives activation scales from whatever text you feed it, so
+the calibration corpus is a real accuracy knob — not just a formality. The
+default `--dataset mix` streams a weighted blend of seven public datasets:
+
+| Share | Source | Contributes |
+|-------|--------|-------------|
+| 20% | [`HuggingFaceH4/ultrachat_200k`](https://huggingface.co/datasets/HuggingFaceH4/ultrachat_200k) | multi-turn chat |
+| 15% | [`allenai/tulu-3-sft-mixture`](https://huggingface.co/datasets/allenai/tulu-3-sft-mixture) | general instruction following |
+| 12% | [`open-r1/Mixture-of-Thoughts`](https://huggingface.co/datasets/open-r1/Mixture-of-Thoughts) (`code`) | code reasoning |
+| 12% | `open-r1/Mixture-of-Thoughts` (`math`) | math reasoning |
+| 15% | [`CohereLabs/aya_dataset`](https://huggingface.co/datasets/CohereLabs/aya_dataset) | 65-language prompts |
+| 10% | [`HuggingFaceTB/smoltalk`](https://huggingface.co/datasets/HuggingFaceTB/smoltalk) (`apigen-80k`) | tool / function calls |
+| 16% | [`eaddario/imatrix-calibration`](https://huggingface.co/datasets/eaddario/imatrix-calibration) (`text_all_small`) | raw 18-language web text |
+
+Everything with turns is rendered through the model's **own chat template**, so
+the template's control tokens appear in the activation statistics. This matters
+for instruct models: a plain-text corpus never shows the model the format it
+will actually be served in. The last row is deliberately *not* templated — it
+is the component that exercises the model outside its instruct format.
+
+Sources are read with `streaming=True`, so a run downloads only the rows it
+samples — `tulu-3` alone is 1.4 GB on disk, and a 512-sample run pulls a few
+tens of MB in total.
+
+`--dataset ultrachat` restores the old single-source behaviour, and any
+HuggingFace dataset ID still works as a single-source mixture (rows with a
+`messages` column are chat-templated; `inputs`/`targets`, `content`, `text`,
+and `article` columns are also recognised, and oversized rows are split into
+`--max-len` chunks rather than truncated).
+
+**Vision.** For a checkpoint with an image processor, 12.5% of the samples come
+from [`unsloth/llava-instruct-mix-vsft-mini`](https://huggingface.co/datasets/unsloth/llava-instruct-mix-vsft-mini)
+as real image+text turns, pushed through the model's own processor. The vision
+tower stays unquantized, but its output embeddings are spliced into the
+decoder's input sequence and their distribution is nothing like a text
+embedding's — without them the decoder's NVFP4 input scales and FP8 KV scales
+are calibrated on half the input distribution the model actually sees. Set
+`--vision-samples 0` for text-only calibration, or an integer to override the
+share. If the processor cannot render inline images the run warns and falls
+back to text only rather than failing.
+
+**Token budget.** `quantize.py` prints the real total after building the set:
+
+```
+Calibration set: 512 samples, 402,131 tokens (vision 64, chat 90, instruct 67, ...)
+```
+
+Samples are truncated at `--max-len`, and most chat rows are shorter than that,
+so the total lands well under `samples × max-len`. Reach for `--samples 1024
+--max-len 2048` (~1.1M tokens) if you want a larger budget, though on a 5B
+model that made no measurable difference to KL against the BF16 original.
+
 ### Multimodal models (Gemma 4, etc.)
 
 Models with vision/audio components need those layers excluded from quantization,
@@ -184,15 +238,16 @@ The original FP16 model is ~950 MB — roughly 2× smaller for W4A4.
 |------|---------|-------------|
 | `--model` | `Qwen/Qwen2.5-0.5B-Instruct` | HuggingFace model ID or local path |
 | `--output` | `<basename>-NVFP4` | Output directory |
-| `--samples` | `256` | Calibration samples (more = better accuracy) |
-| `--max-len` | `512` | Max tokens per calibration sample |
+| `--samples` | `512` | Calibration samples (more = better accuracy) |
+| `--max-len` | `1024` | Max tokens per calibration sample |
 | `--weight-only` | off | Use W4A16 instead of W4A4 |
 | `--ignore` | `lm_head` | Layer names/regex patterns to exclude (use `re:` prefix for regex) |
 | `--pipeline` | `auto` | Calibration pipeline: `auto`, `sequential`, or `basic`. See [Untraceable architectures](#untraceable-architectures) |
 | `--dtype` | `auto` | Model dtype: auto, bfloat16, float16 |
 | `--trust-remote-code` | off | Trust remote code when loading model/tokenizer |
-| `--dataset` | `HuggingFaceH4/ultrachat_200k` | HuggingFace dataset for calibration |
-| `--split` | auto | Dataset split (`train_sft` for ultrachat, `train` otherwise) |
+| `--dataset` | `mix` | Calibration data: a named mixture or a HuggingFace dataset ID. See [Calibration data](#calibration-data) |
+| `--vision-samples` | `auto` | Share of `--samples` that carry an image. See [Calibration data](#calibration-data) |
+| `--split` | auto | Dataset split (`train_sft` for ultrachat, `train` otherwise); ignored for multi-source mixtures |
 | `--cpu-offload` | off | Load model to system RAM; llm-compressor dispatches layers to GPU during calibration (use for large MoE models) |
 
 ---

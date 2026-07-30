@@ -11,6 +11,8 @@ Usage:
     python quantize.py [--model MODEL_ID] [--output OUTPUT_DIR]
                        [--samples N] [--max-len N] [--weight-only]
                        [--no-fp8-attn] [--gptq-mlp {auto,on,off}]
+                       [--fp8-mlp SPEC] [--sensitivity-samples N]
+                       [--sensitivity-report PATH]
                        [--ignore PATTERN ...] [--dtype TYPE]
                        [--trust-remote-code] [--dataset DATASET]
                        [--split SPLIT] [--vision-samples N]
@@ -28,6 +30,11 @@ Defaults:
                  on-disk format, ~20% lower KL vs BF16 than plain minmax.
                  auto enables it for dense models and skips it for MoE,
                  --weight-only, and --no-fp8-attn runs)
+    fp8-mlp    = off (uniform NVFP4 across every dense MLP layer; 'top:N'
+                 keeps the N most quantization-sensitive layers at FP8
+                 instead, an explicit list like '1,2,3,10-15' names them
+                 outright, and 'scan' just prints the ranking)
+    sensitivity-samples = 64 (calibration samples behind the --fp8-mlp rank)
     ignore     = lm_head
     dtype      = auto
     dataset    = mix (chat + instruct + code + math + multilingual + tool
@@ -44,13 +51,16 @@ Defaults:
 import argparse
 import json
 import random
+from contextlib import contextmanager
 from pathlib import Path
 from typing import NamedTuple
 
+import torch
 from compressed_tensors.quantization import (
     QuantizationArgs,
     preset_name_to_scheme,
 )
+from compressed_tensors.quantization.lifecycle.forward import fake_quantize
 from compressed_tensors.utils import match_name
 from compressed_tensors.utils.safetensors_load import (
     get_safetensors_header,
@@ -60,6 +70,7 @@ from datasets import load_dataset
 from llmcompressor import oneshot
 from llmcompressor.modifiers.gptq import GPTQModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
+from llmcompressor.observers import Observer
 from torch.utils.data import DataLoader
 
 # llm-compressor 0.12.0 (current stable) only collects imatrix importance
@@ -440,6 +451,270 @@ def build_calibration_loader(samples: list[dict], seed: int = 42) -> DataLoader:
     return DataLoader(shuffled, batch_size=1, collate_fn=_collate_single)
 
 
+# ---------------------------------------------------------------------------
+# Mixed-precision MLP selection
+# ---------------------------------------------------------------------------
+#
+# NVFP4 stores a weight in ~4.5 bits against FP8's ~8, but layers do not all
+# pay the same accuracy price for that. --fp8-mlp promotes the ones that pay
+# the most back to FP8, buying fidelity with size where it goes furthest.
+#
+# Promotion is per decoder layer, never per projection: vLLM fuses gate_proj
+# and up_proj into a single gate_up_proj and resolves its scheme from whichever
+# shard name its matcher reaches first, so a layer holding both precisions
+# would load as one of them arbitrarily.
+
+
+class LayerSensitivity(NamedTuple):
+    """What promoting one decoder layer's MLP from NVFP4 to FP8 would buy."""
+
+    key: str  # module prefix, e.g. "model.language_model.layers.7"
+    index: int  # decoder layer index
+    nvfp4: float  # mean KL vs the untouched model with only this layer at NVFP4
+    fp8: float  # ... and with only this layer at FP8
+    modules: tuple[str, ...]
+    extra_bytes: int  # on-disk cost of the promotion
+
+    @property
+    def gain(self) -> float:
+        """Output divergence removed by promoting this layer."""
+        return self.nvfp4 - self.fp8
+
+
+def _layer_key(name: str) -> str:
+    """Module prefix shared by one layer's MLP projections."""
+    return name.rsplit(".mlp.", 1)[0]
+
+
+def _layer_index(key: str) -> int:
+    """Decoder index from a layer prefix; -1 when the name has no `.layers.N`."""
+    _, sep, tail = key.rpartition(".layers.")
+    return int(tail) if sep and tail.isdigit() else -1
+
+
+def parse_layer_spec(spec: str) -> set[int]:
+    """Parse a layer selection like "1,2,3,10-15,19" into a set of indices."""
+    indices: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        low, sep, high = part.partition("-")
+        try:
+            indices.update(range(int(low), int(high) + 1) if sep else [int(part)])
+        except ValueError:
+            raise SystemExit(
+                f"--fp8-mlp: cannot parse {part!r} in layer spec {spec!r}. Expected "
+                "'off', 'scan', 'top:N', or indices like '1,2,3,10-15'."
+            ) from None
+    return indices
+
+
+def _stored_bytes(weight, args: QuantizationArgs) -> int:
+    """On-disk size of one weight under `args`, scales included."""
+    numel, rows = weight.numel(), weight.shape[0]
+    if args.num_bits == 8:
+        # One byte per weight plus an fp32 scale per output channel.
+        return numel + 4 * rows
+    # Four bits per weight, one fp8 group scale per `group_size`, one global.
+    return numel // 2 + numel // (args.group_size or 16) + 4
+
+
+def _fake_quant_weight(weight, args: QuantizationArgs, chunk: int = 4096):
+    """Quantize-dequantize `weight` under `args`, same dtype and device.
+
+    Quantization parameters come from the whole tensor -- NVFP4's global scale
+    is tensor-wide -- and only the fake-quant is chunked over output rows,
+    which every strategy here computes row-locally. Chunking keeps a 12B
+    model's largest projection from needing an fp32 copy of itself.
+    """
+    observer = Observer.load_from_registry(args.observer, base_name="weight", args=args)
+    observer(weight)
+    qparams = observer.get_qparams()
+    scale, zero_point = qparams["scale"], qparams["zero_point"]
+    global_scale = qparams.get("global_scale")
+
+    out = torch.empty_like(weight)
+    for start in range(0, weight.shape[0], chunk):
+        stop = start + chunk
+        out[start:stop] = fake_quantize(
+            weight[start:stop],
+            scale[start:stop],
+            None if zero_point is None else zero_point[start:stop],
+            args,
+            global_scale=global_scale,
+        ).to(weight.dtype)
+    return out
+
+
+@contextmanager
+def _swapped_weights(modules: dict, args: QuantizationArgs):
+    """Temporarily replace each module's weight with its fake-quantized self."""
+    originals = {name: module.weight.data for name, module in modules.items()}
+    try:
+        for name, module in modules.items():
+            module.weight.data = _fake_quant_weight(originals[name], args)
+        yield
+    finally:
+        for name, module in modules.items():
+            module.weight.data = originals[name]
+
+
+@torch.no_grad()
+def scan_mlp_sensitivity(
+    model,
+    loader: DataLoader,
+    module_names: list[str],
+    nvfp4_args: QuantizationArgs,
+    fp8_args: QuantizationArgs,
+    n_samples: int,
+    keep_positions: int = 64,
+) -> list[LayerSensitivity]:
+    """Rank decoder layers by what each format costs the model's own output.
+
+    One layer's MLP at a time is fake-quantized while every other weight stays
+    at full precision, and the model's output distribution is compared against
+    the untouched model by mean KL over calibration tokens. That is a direct
+    measurement in the same currency the checkpoint is finally judged in.
+
+    It replaced a cheaper proxy -- activation-weighted weight reconstruction
+    error -- which turned out not to discriminate at all: on gemma-4-E2B every
+    layer scored within 11% of every other, because relative weight error is
+    mostly a property of how Gaussian a matrix is, not of what the layer does.
+
+    Two caveats on the ranking. Per-layer KL measured in isolation does not sum
+    to whole-model KL, since quantization errors in different layers interact,
+    so taking the top N is a greedy heuristic rather than an optimal subset.
+    And both formats are measured with plain minmax: GPTQ later claws back part
+    of the NVFP4 error on whatever stays at NVFP4, which this cannot model.
+    """
+    modules = dict(model.named_modules())
+    layers: dict[str, list[str]] = {}
+    for name in module_names:
+        if name in modules:
+            layers.setdefault(_layer_key(name), []).append(name)
+    if not layers:
+        return []
+
+    device = next(model.parameters()).device
+    batches = []
+    for i, batch in enumerate(loader):
+        if i >= n_samples:
+            break
+        batches.append(
+            {
+                k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
+        )
+    if not batches:
+        return []
+
+    def logprobs(batch):
+        """Log-probs at evenly spaced positions -- the full sequence's worth of
+        vocab logits would be tens of GB to hold as a reference."""
+        logits = model(**batch).logits[0]
+        keep = torch.linspace(
+            0,
+            logits.shape[0] - 1,
+            min(keep_positions, logits.shape[0]),
+            device=logits.device,
+        ).long()
+        return logits[keep].float().log_softmax(-1)
+
+    def mean_kl(reference) -> float:
+        total = count = 0
+        for batch, ref in zip(batches, reference):
+            ref = ref.to(device).float()
+            kl = (ref.exp() * (ref - logprobs(batch))).sum(-1)
+            total += kl.sum().item()
+            count += kl.numel()
+        return total / count
+
+    print(
+        f"Scanning MLP sensitivity: {len(layers)} layers x 2 formats x "
+        f"{len(batches)} samples"
+    )
+    reference = [logprobs(batch).half().cpu() for batch in batches]
+
+    ranking = []
+    for position, (key, names) in enumerate(sorted(layers.items()), start=1):
+        group = {name: modules[name] for name in names}
+        with _swapped_weights(group, nvfp4_args):
+            kl_nvfp4 = mean_kl(reference)
+        with _swapped_weights(group, fp8_args):
+            kl_fp8 = mean_kl(reference)
+        extra = sum(
+            _stored_bytes(module.weight, fp8_args)
+            - _stored_bytes(module.weight, nvfp4_args)
+            for module in group.values()
+        )
+        ranking.append(
+            LayerSensitivity(
+                key=key,
+                index=_layer_index(key),
+                nvfp4=kl_nvfp4,
+                fp8=kl_fp8,
+                modules=tuple(sorted(names)),
+                extra_bytes=extra,
+            )
+        )
+        print(
+            f"  [{position}/{len(layers)}] layer {ranking[-1].index}: "
+            f"NVFP4 {kl_nvfp4:.5f}  FP8 {kl_fp8:.5f}"
+        )
+
+    ranking.sort(key=lambda layer: layer.gain, reverse=True)
+    return ranking
+
+
+def print_sensitivity_table(
+    ranking: list[LayerSensitivity], promoted: set[str] | None = None
+) -> None:
+    """Print the ranking most-sensitive first, marking the promoted layers."""
+    promoted = promoted or set()
+    print(
+        f"\n{'rank':>4} {'layer':>6} {'NVFP4 KL':>10} {'FP8 KL':>9} "
+        f"{'gain':>9} {'+MiB':>7}"
+    )
+    for rank, layer in enumerate(ranking, start=1):
+        mark = " <- FP8" if layer.key in promoted else ""
+        print(
+            f"{rank:>4} {layer.index:>6} {layer.nvfp4:>10.5f} {layer.fp8:>9.5f} "
+            f"{layer.gain:>9.5f} {layer.extra_bytes / 1024**2:>7.1f}{mark}"
+        )
+
+
+def write_sensitivity_report(
+    path: Path, ranking: list[LayerSensitivity], promoted: set[str]
+) -> None:
+    """Dump the full ranking as JSON so a selection can be revisited later."""
+    path.write_text(
+        json.dumps(
+            {
+                "promoted_layers": sorted(
+                    layer.index for layer in ranking if layer.key in promoted
+                ),
+                "layers": [
+                    {
+                        "index": layer.index,
+                        "key": layer.key,
+                        "nvfp4_kl": layer.nvfp4,
+                        "fp8_kl": layer.fp8,
+                        "gain": layer.gain,
+                        "extra_bytes": layer.extra_bytes,
+                        "promoted": layer.key in promoted,
+                        "modules": list(layer.modules),
+                    }
+                    for layer in ranking
+                ],
+            },
+            indent=2,
+        )
+    )
+    print(f"Wrote sensitivity report to {path}")
+
+
 def _collect_tensor_meta(output_dir: Path) -> dict:
     """Map every saved tensor name to its header entry ({dtype, shape, ...})."""
     weight_map = get_weight_mappings(str(output_dir))
@@ -704,6 +979,36 @@ def parse_args():
         "and a non-MoE model.",
     )
     p.add_argument(
+        "--fp8-mlp",
+        default="off",
+        metavar="SPEC",
+        help="Keep the most quantization-sensitive dense MLP layers at FP8 "
+        "instead of NVFP4, trading size for fidelity. 'off' (default) is "
+        "uniform NVFP4. 'top:N' promotes the N layers with the largest "
+        "NVFP4-over-FP8 KL against the unquantized model. An explicit list "
+        "like '1,2,3,10-15,19' promotes exactly those decoder layers. 'scan' "
+        "prints the full sensitivity ranking and exits without quantizing. "
+        "top:N and scan need calibration data, so they cannot be combined "
+        "with --weight-only; an explicit list can. Promotion is always "
+        "whole-layer, because vLLM fuses gate_proj and up_proj into one "
+        "module that can only carry one scheme.",
+    )
+    p.add_argument(
+        "--sensitivity-samples",
+        type=int,
+        default=64,
+        help="Calibration samples the --fp8-mlp ranking measures KL over "
+        "(default: 64). The scan costs two forward passes per layer per "
+        "sample, so this trades scan time against how finely it can separate "
+        "layers whose KL is close.",
+    )
+    p.add_argument(
+        "--sensitivity-report",
+        default=None,
+        metavar="PATH",
+        help="Write the full --fp8-mlp sensitivity ranking to PATH as JSON.",
+    )
+    p.add_argument(
         "--ignore",
         nargs="+",
         default=["lm_head"],
@@ -814,6 +1119,33 @@ def main():
     elif gptq_mlp == "auto" and (args.weight_only or not args.fp8_attn):
         gptq_mlp = "off"
 
+    # --fp8-mlp resolves to a mode now and to concrete module names once the
+    # model (and, for the ranked modes, the calibration data) is loaded.
+    fp8_mlp_mode, fp8_mlp_top, fp8_mlp_indices = "off", 0, set()
+    if args.fp8_mlp == "scan":
+        fp8_mlp_mode = "scan"
+    elif args.fp8_mlp.startswith("top:"):
+        fp8_mlp_mode = "top"
+        try:
+            fp8_mlp_top = int(args.fp8_mlp[len("top:") :])
+        except ValueError:
+            raise SystemExit(
+                f"--fp8-mlp: {args.fp8_mlp!r} is not a number of layers. "
+                "Expected 'top:N', e.g. 'top:12'."
+            ) from None
+        if fp8_mlp_top < 0:
+            raise SystemExit(f"--fp8-mlp top:N needs N >= 0, got {fp8_mlp_top}")
+    elif args.fp8_mlp != "off":
+        fp8_mlp_mode = "explicit"
+        fp8_mlp_indices = parse_layer_spec(args.fp8_mlp)
+
+    if fp8_mlp_mode in ("scan", "top") and args.weight_only:
+        raise SystemExit(
+            "--fp8-mlp scan and top:N rank layers by their activation-weighted "
+            "quantization error, which needs the calibration pass --weight-only "
+            "skips. Pass an explicit layer list instead."
+        )
+
     mode = "W4A16 (weight-only)" if args.weight_only else "W4A4 (weights + activations)"
     if args.fp8_attn:
         mode += " + FP8 attention"
@@ -821,6 +1153,8 @@ def main():
         mode += " + FP8 KV cache"
     if gptq_mlp == "on":
         mode += " + GPTQ MLP"
+    if fp8_mlp_mode != "off":
+        mode += f" + FP8 MLP fallback ({args.fp8_mlp})"
 
     print(f"Model:       {model_id}")
     print(f"Mode:        {mode}")
@@ -925,69 +1259,23 @@ def main():
                     "Rerun with --gptq-mlp off or adjust GPTQ_MLP_TARGET."
                 )
 
-    if gptq_mlp == "on":
-        # GPTQ error compensation is what actually delivers the KL gain — a
-        # plain QuantizationModifier with observer=imatrix_mse only refines
-        # group scales and measures no better than minmax (verified by paired
-        # per-token KL vs BF16 on gemma-4-12B, 2026-07-29). GPTQ owns the MLP
-        # projections; the catch-all Linear group is dropped so the two
-        # modifiers never claim the same module.
-        del config_groups["group_0"]
-        mlp_scheme = preset_name_to_scheme(scheme, [GPTQ_MLP_TARGET])
-        mlp_scheme.weights.observer = "imatrix_mse"
-        mlp_scheme.weights.actorder = "static"
-        gather_recipe = None
-        recipe = [
-            QuantizationModifier(
-                config_groups=config_groups,
-                ignore=args.ignore,
-                kv_cache_scheme=kv_cache_scheme,
-            ),
-            GPTQModifier(
-                config_groups={"group_2": mlp_scheme},
-                ignore=args.ignore,
-            ),
-        ]
-        if IMatrixGatherer is not None:
-            # llm-compressor 0.12.0 only collects imatrix importance stats
-            # when the gatherer runs first; nightlies self-collect (the class
-            # is gone there, hence the guarded import).
-            if args.pipeline == "basic":
-                # The basic pipeline runs every modifier in one shared
-                # calibration epoch, which breaks the gatherer-before-GPTQ
-                # ordering — gather in a separate session instead.
-                gather_recipe = _PersistentIMatrixGatherer(
-                    targets=[GPTQ_MLP_TARGET], ignore=args.ignore
-                )
-            else:
-                recipe.insert(
-                    0, IMatrixGatherer(targets=[GPTQ_MLP_TARGET], ignore=args.ignore)
-                )
-    else:
-        gather_recipe = None
-        recipe = QuantizationModifier(
-            config_groups=config_groups,
-            ignore=args.ignore,
-            kv_cache_scheme=kv_cache_scheme,
-        )
+    # Every dense MLP projection the NVFP4 recipe would claim, enumerated from
+    # the live module tree. --fp8-mlp needs to split this set into two disjoint
+    # explicit target lists: when two groups both match a module the winner is
+    # decided by match order, which is a silent way to load the wrong scheme.
+    mlp_modules = [
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, torch.nn.Linear)
+        and match_name(name, GPTQ_MLP_TARGET)
+        and not any(match_name(name, pattern) for pattern in args.ignore)
+    ]
 
-    # compressed-tensors initializes KV cache scales from the top-level model
-    # config, but multimodal configs (e.g. Gemma 4) nest the attention geometry
-    # inside text_config. Mirror the attributes it reads onto the top-level
-    # config, and drop them after quantization so they don't leak into the
-    # saved config.json.
-    kv_shim_attrs = []
-    text_config = model.config.get_text_config()
-    if kv_cache_scheme is not None and text_config is not model.config:
-        for attr in ("num_attention_heads", "num_key_value_heads", "head_dim"):
-            if not hasattr(model.config, attr) and hasattr(text_config, attr):
-                setattr(model.config, attr, getattr(text_config, attr))
-                kv_shim_attrs.append(attr)
-
-    if args.weight_only:
-        print("Running weight-only quantization (no calibration data needed)...")
-        oneshot(model=model, recipe=recipe)
-    else:
+    # Calibration data is built before the recipe rather than alongside the
+    # quantization call: --fp8-mlp top:N and scan rank layers by running this
+    # data through the unquantized model, and that ranking sets recipe targets.
+    ds = None
+    if not args.weight_only:
         print(f"Loading calibration dataset ({args.dataset})...")
 
         sources = CALIBRATION_MIXES.get(args.dataset)
@@ -1051,6 +1339,143 @@ def main():
         )
         ds = build_calibration_loader(samples)
 
+    fp8_mlp_modules: list[str] = []
+    if fp8_mlp_mode != "off":
+        if not mlp_modules:
+            raise SystemExit(
+                f"--fp8-mlp matched no dense MLP projections ({GPTQ_MLP_TARGET!r}); "
+                "this architecture names its MLP projections differently."
+            )
+        by_index: dict[int, list[str]] = {}
+        for name in mlp_modules:
+            by_index.setdefault(_layer_index(_layer_key(name)), []).append(name)
+
+        if fp8_mlp_mode == "explicit":
+            missing = sorted(fp8_mlp_indices - by_index.keys())
+            if missing:
+                raise SystemExit(
+                    f"--fp8-mlp: no MLP projections in layer(s) {missing}; this "
+                    f"model has layers {min(by_index)}-{max(by_index)}."
+                )
+            fp8_mlp_modules = sorted(n for i in fp8_mlp_indices for n in by_index[i])
+            print(f"FP8 MLP:     layers {sorted(fp8_mlp_indices)} (explicit)")
+        else:
+            ranking = scan_mlp_sensitivity(
+                model,
+                ds,
+                mlp_modules,
+                preset_name_to_scheme("NVFP4", ["Linear"]).weights,
+                preset_name_to_scheme("FP8_DYNAMIC", ["Linear"]).weights,
+                args.sensitivity_samples,
+            )
+            if not ranking:
+                raise SystemExit(
+                    "--fp8-mlp: the sensitivity scan observed no activations, so "
+                    "the calibration forward pass reached none of the MLP "
+                    "projections. Nothing to rank."
+                )
+            if fp8_mlp_top > len(ranking):
+                print(
+                    f"  note: --fp8-mlp top:{fp8_mlp_top} exceeds the "
+                    f"{len(ranking)} MLP layers this model has; promoting all "
+                    "of them, which is plain FP8 with extra steps."
+                )
+            promoted = {layer.key for layer in ranking[:fp8_mlp_top]}
+            print_sensitivity_table(ranking, promoted)
+            if args.sensitivity_report:
+                write_sensitivity_report(
+                    Path(args.sensitivity_report), ranking, promoted
+                )
+            if fp8_mlp_mode == "scan":
+                print("\n--fp8-mlp scan: ranking only, nothing quantized.")
+                return
+            chosen = [layer for layer in ranking if layer.key in promoted]
+            fp8_mlp_modules = sorted(n for layer in chosen for n in layer.modules)
+            print(
+                f"\nFP8 MLP:     layers {sorted(c.index for c in chosen)} "
+                f"(+{sum(c.extra_bytes for c in chosen) / 1024**2:.0f} MiB)"
+            )
+
+    if fp8_mlp_modules:
+        # A group of its own, targeted by exact module name. Exact names outrank
+        # both regex and class-name targets, so this resolves unambiguously
+        # whichever way the NVFP4 side below is expressed.
+        fp8_mlp_scheme = preset_name_to_scheme("FP8_DYNAMIC", fp8_mlp_modules)
+        if args.weight_only:
+            fp8_mlp_scheme.input_activations = None
+        config_groups["group_3"] = fp8_mlp_scheme
+
+    if gptq_mlp == "on":
+        # GPTQ error compensation is what actually delivers the KL gain — a
+        # plain QuantizationModifier with observer=imatrix_mse only refines
+        # group scales and measures no better than minmax (verified by paired
+        # per-token KL vs BF16 on gemma-4-12B, 2026-07-29). GPTQ owns the MLP
+        # projections; the catch-all Linear group is dropped so the two
+        # modifiers never claim the same module.
+        del config_groups["group_0"]
+        # Without a promotion the regex stays, so an unpromoted run produces
+        # exactly the config it always did.
+        promoted_set = set(fp8_mlp_modules)
+        mlp_targets = (
+            [n for n in mlp_modules if n not in promoted_set]
+            if fp8_mlp_modules
+            else [GPTQ_MLP_TARGET]
+        )
+        mlp_scheme = preset_name_to_scheme(scheme, mlp_targets)
+        mlp_scheme.weights.observer = "imatrix_mse"
+        mlp_scheme.weights.actorder = "static"
+        gather_recipe = None
+        recipe = [
+            QuantizationModifier(
+                config_groups=config_groups,
+                ignore=args.ignore,
+                kv_cache_scheme=kv_cache_scheme,
+            ),
+            GPTQModifier(
+                config_groups={"group_2": mlp_scheme},
+                ignore=args.ignore,
+            ),
+        ]
+        if IMatrixGatherer is not None:
+            # llm-compressor 0.12.0 only collects imatrix importance stats
+            # when the gatherer runs first; nightlies self-collect (the class
+            # is gone there, hence the guarded import).
+            if args.pipeline == "basic":
+                # The basic pipeline runs every modifier in one shared
+                # calibration epoch, which breaks the gatherer-before-GPTQ
+                # ordering — gather in a separate session instead.
+                gather_recipe = _PersistentIMatrixGatherer(
+                    targets=mlp_targets, ignore=args.ignore
+                )
+            else:
+                recipe.insert(
+                    0, IMatrixGatherer(targets=mlp_targets, ignore=args.ignore)
+                )
+    else:
+        gather_recipe = None
+        recipe = QuantizationModifier(
+            config_groups=config_groups,
+            ignore=args.ignore,
+            kv_cache_scheme=kv_cache_scheme,
+        )
+
+    # compressed-tensors initializes KV cache scales from the top-level model
+    # config, but multimodal configs (e.g. Gemma 4) nest the attention geometry
+    # inside text_config. Mirror the attributes it reads onto the top-level
+    # config, and drop them after quantization so they don't leak into the
+    # saved config.json.
+    kv_shim_attrs = []
+    text_config = model.config.get_text_config()
+    if kv_cache_scheme is not None and text_config is not model.config:
+        for attr in ("num_attention_heads", "num_key_value_heads", "head_dim"):
+            if not hasattr(model.config, attr) and hasattr(text_config, attr):
+                setattr(model.config, attr, getattr(text_config, attr))
+                kv_shim_attrs.append(attr)
+
+    if args.weight_only:
+        print("Running weight-only quantization (no calibration data needed)...")
+        oneshot(model=model, recipe=recipe)
+    else:
         oneshot_kwargs = {}
         if args.pipeline != "auto":
             oneshot_kwargs["pipeline"] = args.pipeline

@@ -35,6 +35,11 @@ measures ~20% lower KL divergence vs the BF16 original than plain minmax.
 MoE models are skipped automatically (per-expert calibration coverage is too
 thin); pass `--gptq-mlp off` to disable.
 
+Layers differ widely in how much accuracy NVFP4 costs them, so `--fp8-mlp` can
+keep the most sensitive MLP layers at FP8 and leave the rest at NVFP4 — off by
+default, since it trades size for fidelity. See
+[Mixed-precision MLP](#mixed-precision-mlp).
+
 **Hardware requirement:** Blackwell GPUs (SM 12.0+). On older architectures vLLM falls
 back to weight-only dequantization, losing most of the speedup.
 
@@ -173,6 +178,74 @@ so the total lands well under `samples × max-len`. Reach for `--samples 1024
 --max-len 2048` (~1.1M tokens) if you want a larger budget, though on a 5B
 model that made no measurable difference to KL against the BF16 original.
 
+### Mixed-precision MLP
+
+NVFP4 stores a weight in about 4.5 bits against FP8's 8, but layers do not all
+pay the same accuracy price for that discount. `--fp8-mlp` keeps the layers
+that pay the most at FP8 and leaves the rest at NVFP4, spending size where it
+buys the most fidelity.
+
+Start by looking at the ranking without committing to anything:
+
+```bash
+python quantize.py --model google/gemma-4-E2B-it --pipeline basic \
+  --fp8-mlp scan --sensitivity-report e2b-sensitivity.json
+```
+
+```
+rank  layer   NVFP4 KL    FP8 KL      gain    +MiB
+   1     21    0.10793   0.00242   0.10551     5.5
+   2      3    0.04713   0.00351   0.04362     5.5
+   3      2    0.04173   0.00229   0.03943     5.5
+...
+  24      9    0.00460   0.00423   0.00037     5.5
+```
+
+Each row is a direct measurement, not a heuristic: one layer's MLP is
+fake-quantized while every other weight in the model stays at full precision,
+and the model's output distribution is compared against the untouched model by
+mean KL over calibration tokens. `gain` is what promoting that layer to FP8
+buys, and `+MiB` is what it costs on disk. The spread is large — two orders of
+magnitude between the most and least sensitive layer is normal — which is the
+whole reason a uniform layout leaves accuracy on the table.
+
+Then commit, either by count or by naming layers outright:
+
+```bash
+python quantize.py --model google/gemma-4-E2B-it --pipeline basic --fp8-mlp top:12
+python quantize.py --model google/gemma-4-E2B-it --pipeline basic --fp8-mlp 1,2,3,10-15,19,20,23
+```
+
+Promotion is always whole-layer. vLLM fuses `gate_proj` and `up_proj` into a
+single `gate_up_proj` module and resolves its scheme from whichever shard name
+its matcher reaches first, so a layer holding both precisions would load as one
+of them arbitrarily. The promoted layers are written to their own config group
+targeted by exact module name, and the NVFP4 group's targets are narrowed to
+the complement — two disjoint lists, so no module can match both groups.
+
+Three things worth knowing before trusting the ranking:
+
+- **Per-layer KL does not add up.** Quantization errors in different layers
+  interact, so the top N by marginal KL is a greedy pick, not a proven-optimal
+  subset. The scan tells you where to spend, not exactly how much you'll get.
+- **It cannot see GPTQ.** Both formats are measured with plain minmax. GPTQ
+  then claws back part of the NVFP4 error on whatever stays at NVFP4, which
+  shrinks the real gain relative to what the table shows.
+- **It costs forward passes.** Two per layer per sample, plus one reference
+  pass. Lower `--sensitivity-samples` (default 64) to trade resolution between
+  close-scoring layers for scan time.
+- **The ranking depends on `--dataset`.** Scanning gemma-4-E2B on the `mix`
+  corpus and on ultrachat alone agrees on only 8 of the top 12 layers
+  (Spearman ρ = 0.67 across all 35). The mix pushes the earliest layers far up
+  the ranking — layer 0 goes from 18th on ultrachat to 1st — which is what you
+  would expect when image embeddings and non-English text are spliced into the
+  input, since that is where those distributions differ most from plain
+  English chat. Scan on the data you intend to serve, and prefer the corpus you
+  are going to calibrate with.
+
+`--fp8-mlp` needs calibration data for `scan` and `top:N`, so neither combines
+with `--weight-only`; an explicit layer list works in either mode.
+
 ### Multimodal models (Gemma 4, etc.)
 
 Models with vision/audio components need those layers excluded from quantization,
@@ -241,6 +314,9 @@ The original FP16 model is ~950 MB — roughly 2× smaller for W4A4.
 | `--samples` | `512` | Calibration samples (more = better accuracy) |
 | `--max-len` | `1024` | Max tokens per calibration sample |
 | `--weight-only` | off | Use W4A16 instead of W4A4 |
+| `--fp8-mlp` | `off` | Keep the most quantization-sensitive MLP layers at FP8. See [Mixed-precision MLP](#mixed-precision-mlp) |
+| `--sensitivity-samples` | `64` | Calibration samples the `--fp8-mlp` ranking measures KL over |
+| `--sensitivity-report` | none | Write the full `--fp8-mlp` ranking to a path as JSON |
 | `--ignore` | `lm_head` | Layer names/regex patterns to exclude (use `re:` prefix for regex) |
 | `--pipeline` | `auto` | Calibration pipeline: `auto`, `sequential`, or `basic`. See [Untraceable architectures](#untraceable-architectures) |
 | `--dtype` | `auto` | Model dtype: auto, bfloat16, float16 |

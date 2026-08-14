@@ -18,6 +18,7 @@ so all `vllm serve` options are available, e.g.:
 """
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -116,6 +117,15 @@ def parse_args():
         "when the CUDA toolkit is missing — then 'cutlass' is used "
         "since FlashInfer backends JIT-compile with nvcc.",
     )
+    p.add_argument(
+        "--attention-backend",
+        default=None,
+        help="Force the attention backend (e.g. FLASHINFER, TRITON_ATTN, "
+        "FLASH_ATTN). Default: vLLM auto-selects, except when the CUDA "
+        "toolkit is missing — then 'TRITON_ATTN' is used since the "
+        "FLASHINFER backend JIT-compiles its prefill/decode modules "
+        "with nvcc at startup.",
+    )
 
     # Performance
     p.add_argument(
@@ -189,14 +199,29 @@ def main():
     env = os.environ.copy()
     linear_backend = args.linear_backend
     moe_backend = args.moe_backend
+    attention_backend = args.attention_backend
     have_nvcc = cuda_toolkit_available()
     if not have_nvcc:
-        # FlashInfer's NVFP4 GEMM, fused-MoE, and top-k/top-p sampling
-        # kernels are JIT-compiled at startup and crash without the CUDA
-        # toolkit, so steer vLLM to its built-in kernels instead.
+        # FlashInfer's NVFP4 GEMM, fused-MoE, top-k/top-p sampling, and
+        # (since vLLM 0.27) attention kernels are JIT-compiled at startup
+        # and crash without the CUDA toolkit, so steer vLLM to its
+        # built-in kernels instead.
         linear_backend = linear_backend or "cutlass"
         moe_backend = moe_backend or "cutlass"
+        attention_backend = attention_backend or "TRITON_ATTN"
         env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+        if args.speculative_config:
+            # vLLM never inherits the attention backend for the draft
+            # model — it re-autoselects (preferring FlashInfer, which
+            # JIT-compiles on the first request) unless the speculative
+            # config names one itself.
+            spec = args.speculative_config.strip()
+            if spec.startswith("{"):
+                spec_dict = json.loads(spec)
+            else:
+                spec_dict = json.loads(Path(spec).expanduser().read_text())
+            spec_dict.setdefault("attention_backend", attention_backend)
+            args.speculative_config = json.dumps(spec_dict)
 
     cmd = [
         sys.executable,
@@ -236,6 +261,8 @@ def main():
         cmd += ["--linear-backend", linear_backend]
     if moe_backend and moe_backend != "auto":
         cmd += ["--moe-backend", moe_backend]
+    if attention_backend and attention_backend != "auto":
+        cmd += ["--attention-backend", attention_backend]
     if args.enforce_eager:
         cmd += ["--enforce-eager"]
     if args.enable_prefix_caching:
@@ -265,7 +292,8 @@ def main():
     if not have_nvcc:
         print(
             "Note: CUDA toolkit (nvcc) not found — using built-in CUTLASS "
-            "linear and MoE kernels and disabling the FlashInfer sampler.\n"
+            "linear and MoE kernels, the Triton attention backend, and "
+            "disabling the FlashInfer sampler.\n"
         )
 
     try:

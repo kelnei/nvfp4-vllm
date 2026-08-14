@@ -8,13 +8,30 @@ dependencies = [
     "llmcompressor==0.12.0",
     # llmcompressor 0.12.0 caps transformers at 5.10.1
     "transformers==5.10.1",
-    "vllm==0.25.1",
+    "vllm==0.27.1",
     "datasets>=4.8.4",
 ]
 
+[project.optional-dependencies]
+# DeltaNet calibration fast path (transformers falls back to a slow torch
+# implementation without these). causal-conv1d is an sdist that needs nvcc;
+# install with the ~/cuda-13.0 env vars active: uv sync --extra fast-calib
+fast-calib = [
+    "flash-linear-attention",
+    "causal-conv1d",
+]
+
 [tool.uv]
-# vllm 0.25.1 pins compressed-tensors==0.17.0 while llmcompressor 0.12.0
+# vllm 0.27.1 pins compressed-tensors==0.17.0 while llmcompressor 0.12.0
 # pins ==0.17.1; force the newer patch release so both can resolve.
+# vllm 0.27.1 also pins torch==2.13.0, above llmcompressor 0.12.0's <=2.12.0
+# cap; the cap is a conservative bound (0.13.0 allows 2.13.0 with the same
+# code paths), so override it rather than take llmcompressor 0.13.0's
+# compressed-tensors==0.18.0 minor-version jump.
 override-dependencies = [
     "compressed-tensors==0.17.1",
+    "torch==2.13.0",
 ]
+# causal-conv1d's setup.py imports torch, so it cannot build in an isolated
+# environment.
+no-build-isolation-package = ["causal-conv1d"]

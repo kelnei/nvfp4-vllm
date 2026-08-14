@@ -7,10 +7,16 @@ calibrated — the mixed-precision layout vLLM's NVFP4 kernels expect. FP8
 attention is ~3.5x closer to the original weights than NVFP4 for a small
 size cost (~13% on a dense 12B, ~1% on a MoE).
 
+On hybrid linear-attention models (Qwen3.5/3.6/3.8), the Gated DeltaNet
+qkv/z/out projections get an explicit NVFP4 group of their own (FP8 with
+--fp8-deltanet) and the tiny in_proj_a/in_proj_b gating projections stay
+unquantized — automatic, keyed off the live module tree.
+
 Usage:
     python quantize.py [--model MODEL_ID] [--output OUTPUT_DIR]
                        [--samples N] [--max-len N] [--weight-only]
-                       [--no-fp8-attn] [--gptq-mlp {auto,on,off}]
+                       [--no-fp8-attn] [--fp8-deltanet]
+                       [--gptq-mlp {auto,on,off}]
                        [--fp8-mlp SPEC] [--sensitivity-samples N]
                        [--sensitivity-report PATH]
                        [--ignore PATTERN ...] [--dtype TYPE]
@@ -25,6 +31,9 @@ Defaults:
     weight-only = False (W4A4; set flag for W4A16)
     fp8-attn   = True (FP8 attention + FP8 KV cache; the KV cache scale
                  needs calibration, so it is skipped with --weight-only)
+    fp8-deltanet = False (NVFP4 DeltaNet projections on hybrid models;
+                 set the flag to keep them at FP8 instead — ~+1.5GB on a
+                 27B for most of the DeltaNet quantization KL back)
     gptq-mlp   = auto (GPTQ + imatrix_mse observer + static actorder on
                  dense MLP gate/up/down projections; calibration-only, same
                  on-disk format, ~20% lower KL vs BF16 than plain minmax.
@@ -128,6 +137,21 @@ FP8_ATTN_FUSED_TARGET = r"re:.*self_attn\.qkv_proj$"
 # match, deliberately: per-expert calibration coverage is too thin for
 # activation-statistics observers to be trustworthy there.
 GPTQ_MLP_TARGET = r"re:.*\.mlp\.(gate|up|down)_proj$"
+
+# Gated DeltaNet projections on hybrid linear-attention models (Qwen3.5/3.6/
+# 3.8 `linear_attn` layers). All five are plain nn.Linear, so the catch-all
+# Linear group covers them -- but --gptq-mlp on deletes that group, and
+# neither surviving regex (self_attn FP8, .mlp GPTQ) matches linear_attn, so
+# every DeltaNet projection silently stayed BF16 (the 25% size gap against
+# unsloth's Qwen3.6-27B-NVFP4). Naming them here keeps them quantized in both
+# recipe shapes. in_proj_a and in_proj_b produce the recurrence's decay and
+# beta gating scalars and round to nothing beside the qkv/z/out projections;
+# following unsloth's split they stay unquantized via the ignore list.
+DELTANET_TARGET = r"re:.*linear_attn\.(in_proj_qkv|in_proj_z|out_proj)$"
+DELTANET_IGNORE = (
+    r"re:.*linear_attn\.in_proj_a$",
+    r"re:.*linear_attn\.in_proj_b$",
+)
 
 # The Gemma-4 E-series per-layer embedding table, quantized to INT8 by
 # --int8-ple. It is a lookup table, not a matmul, so this is weight-only; vLLM
@@ -1035,6 +1059,16 @@ def parse_args():
         "uniform NVFP4.",
     )
     p.add_argument(
+        "--fp8-deltanet",
+        action="store_true",
+        help="On hybrid linear-attention models, keep the Gated DeltaNet "
+        "projections (in_proj_qkv/in_proj_z/out_proj) at FP8 (channel-wise "
+        "weights, dynamic per-token activations) instead of NVFP4, trading "
+        "size for fidelity — quantizing DeltaNet to NVFP4 costs ~+0.0045 "
+        "weight-only KL on Qwen3.6-27B. No effect on models without "
+        "linear_attn modules.",
+    )
+    p.add_argument(
         "--gptq-mlp",
         choices=["auto", "on", "off"],
         default="auto",
@@ -1319,6 +1353,29 @@ def main():
             "architecture likely fuses QKV or uses MLA naming. Rerun with "
             "--no-fp8-attn or adjust FP8_ATTN_TARGET."
         )
+
+    # Hybrid linear-attention models get an explicit DeltaNet group so the
+    # projections survive --gptq-mlp deleting the catch-all Linear group.
+    # Resolved from the live module tree: non-hybrid models keep their
+    # config_groups (and saved config.json) unchanged.
+    if any(match_name(name, DELTANET_TARGET) for name, _ in model.named_modules()):
+        args.ignore = list(args.ignore) + list(DELTANET_IGNORE)
+        if args.fp8_deltanet:
+            deltanet_scheme = preset_name_to_scheme("FP8_DYNAMIC", [DELTANET_TARGET])
+            if args.weight_only:
+                # Same A16 contract as --fp8-attn: FP8 weights only.
+                deltanet_scheme.input_activations = None
+            deltanet_name = "FP8"
+        else:
+            deltanet_scheme = preset_name_to_scheme(scheme, [DELTANET_TARGET])
+            deltanet_name = scheme
+        config_groups["group_5"] = deltanet_scheme
+        print(
+            f"DeltaNet:    {deltanet_name} on {DELTANET_TARGET!r} "
+            "(in_proj_a/in_proj_b left unquantized)"
+        )
+    elif args.fp8_deltanet:
+        print("FP8 DeltaNet: no linear_attn modules on this model; no effect")
 
     # --gptq-mlp needs the live module tree: auto skips MoE models, and the
     # recipe with GPTQ drops the catch-all Linear group, which would leave

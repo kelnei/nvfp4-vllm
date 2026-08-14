@@ -306,10 +306,17 @@ uniform NVFP4 (0.0648 / 0.1502), a statistical tie with unsloth — but still
 behind the KL scan's picks (0.0455 / 0.0985). Where sensitivity is genuinely
 local, the direct KL measurement stays the better ranker.
 
-Practical rule: on Qwen-family hybrids use `--fp8-mlp gptq-loss:N` (or the
-equivalent explicit late-layer list); on gemma-class models keep `top:N`.
-The non-clean contexts stay available as diagnostics for the next
-architecture that disagrees with its scan.
+The mode is validated end to end: rebuilding Qwen3.8-27B with the release
+recipe and `--fp8-mlp gptq-loss:8` in place of the hand-fed list promoted
+56–63 unaided and produced a checkpoint byte-identical to the explicit-list
+build in every tensor. (Treat the byte-identity as a bonus, not a guarantee —
+GPTQ determinism is model-dependent; judge requants by KL.)
+
+Practical rule: on Qwen-family hybrids use `--fp8-mlp gptq-loss:8` — no
+hand-fed layer list needed; raise `:8` only if you want to spend more than
+eight layers' worth of size. On gemma-class models keep `top:N`. The
+non-clean contexts stay available as diagnostics for the next architecture
+that disagrees with its scan.
 
 #### Why the scan uses a different corpus than calibration
 

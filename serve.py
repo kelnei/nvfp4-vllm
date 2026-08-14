@@ -194,15 +194,28 @@ def cuda_toolkit_available() -> bool:
 
 
 def thinking_chat_template(model: str) -> bool:
-    """Whether a local checkpoint's chat template opens a <think> block.
+    """Whether the checkpoint's chat template opens a <think> block.
 
     Qwen3-family templates end the generation prompt with a literal
     '<think>\\n', so the raw completion is reasoning, '</think>', then the
     answer — vLLM needs a reasoning parser to split those apart.
+
+    Accepts a local directory or an HF model ID whose files are already in
+    the local HF cache (a cache miss stays False rather than downloading).
     """
     path = Path(model)
     if not path.is_dir():
-        return False
+        try:
+            from huggingface_hub import try_to_load_from_cache
+        except ImportError:
+            return False
+        for filename in ("chat_template.jinja", "tokenizer_config.json"):
+            cached = try_to_load_from_cache(model, filename)
+            if isinstance(cached, str):
+                path = Path(cached).parent
+                break
+        else:
+            return False
     jinja = path / "chat_template.jinja"
     if jinja.is_file():
         return "<think>" in jinja.read_text()

@@ -146,6 +146,18 @@ def parse_args():
         help="JSON string or file path for speculative decoding config",
     )
 
+    # Reasoning models
+    p.add_argument(
+        "--reasoning-parser",
+        default="auto",
+        help="Parser that splits the model's <think> block into the API's "
+        "reasoning_content field (e.g. qwen3, deepseek_r1). Without one, "
+        "reasoning text and the closing </think> land in message.content. "
+        "'auto' (default) uses 'qwen3' when a local checkpoint's chat "
+        "template pre-opens a <think> block in its generation prompt, as "
+        "Qwen3-family reasoning models do; 'none' disables.",
+    )
+
     # Tool calling
     p.add_argument(
         "--tool-call-parser",
@@ -179,6 +191,29 @@ def cuda_toolkit_available() -> bool:
         home and os.access(Path(home).expanduser() / "bin" / "nvcc", os.X_OK)
         for home in candidates
     )
+
+
+def thinking_chat_template(model: str) -> bool:
+    """Whether a local checkpoint's chat template opens a <think> block.
+
+    Qwen3-family templates end the generation prompt with a literal
+    '<think>\\n', so the raw completion is reasoning, '</think>', then the
+    answer — vLLM needs a reasoning parser to split those apart.
+    """
+    path = Path(model)
+    if not path.is_dir():
+        return False
+    jinja = path / "chat_template.jinja"
+    if jinja.is_file():
+        return "<think>" in jinja.read_text()
+    config = path / "tokenizer_config.json"
+    if config.is_file():
+        try:
+            template = json.loads(config.read_text()).get("chat_template")
+        except (OSError, json.JSONDecodeError):
+            return False
+        return "<think>" in str(template)
+    return False
 
 
 def main():
@@ -269,6 +304,13 @@ def main():
         cmd += ["--enable-prefix-caching"]
     if args.speculative_config:
         cmd += ["--speculative-config", args.speculative_config]
+    reasoning_parser = args.reasoning_parser
+    if reasoning_parser == "auto":
+        reasoning_parser = "qwen3" if thinking_chat_template(args.model) else None
+    elif reasoning_parser == "none":
+        reasoning_parser = None
+    if reasoning_parser:
+        cmd += ["--reasoning-parser", reasoning_parser]
     if args.tool_call_parser:
         cmd += ["--tool-call-parser", args.tool_call_parser]
     if args.enable_auto_tool_choice:

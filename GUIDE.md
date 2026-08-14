@@ -214,8 +214,9 @@ rank  layer   NVFP4 KL    FP8 KL      gain    +MiB
 ```
 
 Each row is a direct measurement, not a heuristic: one layer's MLP is
-fake-quantized while every other weight in the model stays at full precision,
-and the model's output distribution is compared against the untouched model by
+fake-quantized — weights *and* input activations, the same two formats W4A4
+serving uses — while every other layer stays at full precision, and the
+model's output distribution is compared against the untouched model by
 mean KL over calibration tokens. `gain` is what promoting that layer to FP8
 buys, and `+MiB` is what it costs on disk. The spread is large — two orders of
 magnitude between the most and least sensitive layer is normal — which is the
@@ -242,7 +243,9 @@ Four things worth knowing before trusting the ranking:
   subset. The scan tells you where to spend, not exactly how much you'll get.
 - **It cannot see GPTQ.** Both formats are measured with plain minmax. GPTQ
   then claws back part of the NVFP4 error on whatever stays at NVFP4, which
-  shrinks the real gain relative to what the table shows.
+  shrinks the real gain relative to what the table shows — and on Qwen-family
+  hybrids it does more than shrink it, it reorders the layers entirely (see
+  the next section).
 - **It costs forward passes.** Two per layer per sample, plus one reference
   pass. Lower `--sensitivity-samples` (default 64) to trade resolution between
   close-scoring layers for scan time.
@@ -251,8 +254,62 @@ Four things worth knowing before trusting the ranking:
   defaults to `mix`. Ranking on the wide mixture instead gives back about a
   third of what the feature buys (31-39% across four measurements) — see below.
 
-`--fp8-mlp` needs calibration data for `scan` and `top:N`, so neither combines
-with `--weight-only`; an explicit layer list works in either mode.
+`--fp8-mlp` needs calibration data for the ranked modes (`scan`, `top:N`,
+`gptq-loss[:N]`), so none of them combine with `--weight-only`; an explicit
+layer list works in either mode.
+
+#### Qwen-family hybrids: rank with `gptq-loss`, not the KL scan
+
+On Qwen3.6/3.8-class hybrids the scan's picks measurably lose. Qwen3.8-27B is
+the documented case: the scan promoted eight early/mid layers, and rebuilding
+the checkpoint with the last eight (56–63, where `down_proj` input amax runs
+300–717 against ~30 mid-stack) measured ~0.0016 lower emulated KL end to end
+on identical evaluation sequences. An amax-ranked top-8 (54, 55, 58–63 — read
+for free from the stored `input_global_scale`, amax = 2688 / scale) tied the
+last-8 list exactly. gemma is the opposite: its sensitive layers are genuinely
+local, unsloth's own picks there are early/mid and irregular, and the scan
+finds them — the failure is Qwen-specific, not general.
+
+Chasing this down ruled out every cheap explanation. `--sensitivity-context`
+ships the experiments: `quantized` measures each layer's FP8-promotion
+marginal against a baseline with *every* MLP layer fake-quantized (weights and
+activations; the BF16 originals park in CPU RAM for the scan), and
+`quantized-acts` quantizes activations only, isolating the activation-format
+half of a promotion. Both still rank early/mid layers on top and put 54–63
+near the bottom on Qwen3.8, and a third of in-context marginals come out
+*negative* — promoting a single layer can worsen a fully-quantized model by
+removing error cancellation. Whatever makes the late layers worth promoting in
+a shipped checkpoint is not visible to any minmax fake-quant trial, isolated
+or in context: it emerges through the GPTQ pipeline, whose sequential error
+compensation reshapes where the residual error lives.
+
+The metric that does recover the list is GPTQ's own proxy loss, shipped as
+`--fp8-mlp gptq-loss[:N]`. For each MLP projection it accumulates the input
+Hessian from clean forward passes over the sensitivity corpus, runs
+llm-compressor's `quantize_weight` under both formats, and keeps the loss
+that call returns — the Hessian-weighted output MSE left after GPTQ's
+sequential compensation, i.e. the exact quantity GPTQ minimizes, measured at
+the injection site *before* downstream layers and error cancellation absorb
+it. On Qwen3.8-27B its top eight layers are exactly 56–63 — the
+checkpoint-validated winner no KL trial finds — with 54 and 55 (the
+amax-ranked complement) at ranks nine and ten. The NVFP4/FP8 loss ratio is
+nearly constant across layers (~13x), so the ranking effectively measures
+per-layer Hessian energy; the free amax read from `input_global_scale` is
+its crude one-number approximation.
+
+It is not a depth artifact, and gemma keeps its own answer. On E2B the
+gptq-loss ranking picks early/mid layers (0–5 plus a 23–29 block), and an
+A/B under the identical July recipe on identical evaluation sequences
+measured `gptq-loss:12` at 0.0500 / 0.1168 KL (weight-only / emulated) —
+better than an amax-ranked top-12 (0.0541 / 0.1242) and far better than
+uniform NVFP4 (0.0648 / 0.1502), a statistical tie with unsloth — but still
+behind the KL scan's picks (0.0455 / 0.0985). Where sensitivity is genuinely
+local, the direct KL measurement stays the better ranker.
+
+Practical rule: on Qwen-family hybrids use `--fp8-mlp gptq-loss:N` (or the
+equivalent explicit late-layer list); on gemma-class models keep `top:N`.
+The non-clean contexts stay available as diagnostics for the next
+architecture that disagrees with its scan.
 
 #### Why the scan uses a different corpus than calibration
 
@@ -454,9 +511,10 @@ The original FP16 model is ~950 MB — roughly 2× smaller for W4A4.
 | `--max-len` | `1024` | Max tokens per calibration sample |
 | `--weight-only` | off | Use W4A16 instead of W4A4 |
 | `--fp8-deltanet` | off | Keep Gated DeltaNet projections at FP8 on hybrid models. See [FP8 DeltaNet](#fp8-deltanet-hybrid-linear-attention-models) |
-| `--fp8-mlp` | `off` | Keep the most quantization-sensitive MLP layers at FP8. See [Mixed-precision MLP](#mixed-precision-mlp) |
+| `--fp8-mlp` | `off` | Keep the most quantization-sensitive MLP layers at FP8: `top:N` / `scan` (KL trials), `gptq-loss[:N]` (GPTQ proxy loss — use on Qwen-family hybrids), or an explicit layer list. See [Mixed-precision MLP](#mixed-precision-mlp) |
 | `--sensitivity-dataset` | `ultrachat` | Data the `--fp8-mlp` ranking is measured on. Defaults differently from `--dataset` deliberately — see [Mixed-precision MLP](#mixed-precision-mlp) |
-| `--sensitivity-samples` | `64` | Calibration samples the `--fp8-mlp` ranking measures KL over |
+| `--sensitivity-samples` | `64` | Calibration samples behind the `--fp8-mlp` ranking (KL trials or Hessian accumulation) |
+| `--sensitivity-context` | `clean` | Model state during each `--fp8-mlp` trial: `clean` (one layer at a time), `quantized` / `quantized-acts` (promotion marginals against an all-quantized baseline — diagnostics; see [Mixed-precision MLP](#mixed-precision-mlp)) |
 | `--sensitivity-report` | none | Write the full `--fp8-mlp` ranking to a path as JSON |
 | `--int8-ple` | `off` | INT8 the Gemma-4 E-series per-layer embedding table: ~30% smaller, at a measured cost to non-English fidelity. See [Per-layer embeddings](#per-layer-embeddings-gemma-4-e-series) |
 | `--ignore` | `lm_head` | Layer names/regex patterns to exclude (use `re:` prefix for regex) |

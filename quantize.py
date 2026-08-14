@@ -19,6 +19,7 @@ Usage:
                        [--gptq-mlp {auto,on,off}]
                        [--fp8-mlp SPEC] [--sensitivity-samples N]
                        [--sensitivity-report PATH]
+                       [--sensitivity-context {clean,quantized}]
                        [--ignore PATTERN ...] [--dtype TYPE]
                        [--trust-remote-code] [--dataset DATASET]
                        [--split SPLIT] [--vision-samples N]
@@ -41,9 +42,21 @@ Defaults:
                  --weight-only, and --no-fp8-attn runs)
     fp8-mlp    = off (uniform NVFP4 across every dense MLP layer; 'top:N'
                  keeps the N most quantization-sensitive layers at FP8
-                 instead, an explicit list like '1,2,3,10-15' names them
-                 outright, and 'scan' just prints the ranking)
+                 instead, 'gptq-loss:N' ranks by GPTQ's own Hessian-weighted
+                 proxy loss rather than per-layer KL trials, an explicit
+                 list like '1,2,3,10-15' names them outright, and 'scan' or
+                 'gptq-loss' just print the ranking. KL sensitivity is
+                 measured W4A4-faithfully: each trial fake-quantizes the
+                 layer's input activations along with its weights, the same
+                 two formats serving uses. On Qwen-family hybrids the KL
+                 trials do not predict the measured promotion value --
+                 use gptq-loss there; see GUIDE.md)
     sensitivity-samples = 64 (calibration samples behind the --fp8-mlp rank)
+    sensitivity-context = clean (each trial quantizes one layer against an
+                 otherwise-BF16 model; 'quantized' scores each layer's FP8
+                 promotion against an all-MLP-quantized baseline instead,
+                 and 'quantized-acts' quantizes activations only -- both
+                 diagnostics, not better default rankers)
     ignore     = lm_head
     dtype      = auto
     dataset    = mix (chat + instruct + code + math + multilingual + tool
@@ -562,8 +575,8 @@ class LayerSensitivity(NamedTuple):
 
     key: str  # module prefix, e.g. "model.language_model.layers.7"
     index: int  # decoder layer index
-    nvfp4: float  # mean KL vs the untouched model with only this layer at NVFP4
-    fp8: float  # ... and with only this layer at FP8
+    nvfp4: float  # this layer's cost at NVFP4 (mean KL, or GPTQ proxy loss)
+    fp8: float  # ... and at FP8, same metric
     modules: tuple[str, ...]
     extra_bytes: int  # on-disk cost of the promotion
 
@@ -597,7 +610,8 @@ def parse_layer_spec(spec: str) -> set[int]:
         except ValueError:
             raise SystemExit(
                 f"--fp8-mlp: cannot parse {part!r} in layer spec {spec!r}. Expected "
-                "'off', 'scan', 'top:N', or indices like '1,2,3,10-15'."
+                "'off', 'scan', 'top:N', 'gptq-loss[:N]', or indices like "
+                "'1,2,3,10-15'."
             ) from None
     return indices
 
@@ -652,6 +666,107 @@ def _swapped_weights(modules: dict, args: QuantizationArgs):
             module.weight.data = originals[name]
 
 
+# FP4 E2M1 representable magnitudes and the midpoints between them, for
+# round-to-nearest. Kept on CPU; moved to the activation's device on use.
+_FP4_LEVELS = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+_FP4_MIDPOINTS = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
+
+
+def _fake_quant_nvfp4_activation(x, global_scale: float):
+    """Quantize-dequantize one activation tensor the way NVFP4 W4A4 serving
+    does: group-16 FP4 with per-group FP8-E4M3 scales computed per token, under
+    a static per-tensor global scale (448*6/amax) fixed at calibration.
+
+    The static global scale is the part that hurts on outlier-heavy layers:
+    one huge calibration amax shrinks it for every token thereafter, pushing
+    ordinary groups' scales toward the bottom of the FP8 range.
+    """
+    hidden = x.shape[-1]
+    pad = (-hidden) % 16
+    v = torch.nn.functional.pad(x, (0, pad)) if pad else x
+    groups = v.float().reshape(-1, (hidden + pad) // 16, 16)
+
+    group_amax = groups.abs().amax(-1, keepdim=True)
+    group_scale = (group_amax * (global_scale / 6.0)).to(torch.float8_e4m3fn).float()
+    group_scale = torch.where(
+        group_scale == 0, torch.ones_like(group_scale), group_scale
+    )
+
+    scaled = (groups * (global_scale / group_scale)).clamp(-6.0, 6.0)
+    idx = torch.bucketize(scaled.abs(), _FP4_MIDPOINTS.to(scaled.device))
+    quant = scaled.sign() * _FP4_LEVELS.to(scaled.device)[idx]
+
+    out = (quant * (group_scale / global_scale)).reshape(*x.shape[:-1], -1)
+    return (out[..., :hidden] if pad else out).to(x.dtype)
+
+
+def _fake_quant_fp8_activation(x):
+    """Quantize-dequantize one activation tensor as FP8 serving does: dynamic
+    per-token E4M3 scales, so outlier tokens cannot poison anyone else's."""
+    scale = x.abs().amax(-1, keepdim=True).float().clamp(min=1e-12) / 448.0
+    quant = (x.float() / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return (quant.float() * scale).to(x.dtype)
+
+
+@contextmanager
+def _recorded_input_amax(modules: dict, store: dict):
+    """Record each module's largest input magnitude seen while active -- the
+    scan's stand-in for the calibration amax behind input_global_scale."""
+    handles = []
+
+    def recorder(name):
+        def hook(_module, inputs):
+            amax = inputs[0].abs().amax().item()
+            store[name] = max(store.get(name, 0.0), amax)
+
+        return hook
+
+    try:
+        for name, module in modules.items():
+            handles.append(module.register_forward_pre_hook(recorder(name)))
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def _activation_pre_hook(fmt: str, global_scale: float = 0.0):
+    """Forward-pre-hook that fake-quantizes a module's input as `fmt`."""
+    if fmt == "nvfp4":
+
+        def hook(_module, inputs):
+            return (_fake_quant_nvfp4_activation(inputs[0], global_scale),) + tuple(
+                inputs[1:]
+            )
+
+    else:
+
+        def hook(_module, inputs):
+            return (_fake_quant_fp8_activation(inputs[0]),) + tuple(inputs[1:])
+
+    return hook
+
+
+@contextmanager
+def _quantized_activations(modules: dict, fmt: str, amax_by_name: dict):
+    """Temporarily fake-quantize each module's input activations as `fmt`."""
+    handles = []
+    try:
+        for name, module in modules.items():
+            if fmt == "nvfp4":
+                amax = amax_by_name.get(name, 0.0)
+                if amax <= 0:
+                    continue
+                hook = _activation_pre_hook("nvfp4", 448.0 * 6.0 / amax)
+            else:
+                hook = _activation_pre_hook("fp8")
+            handles.append(module.register_forward_pre_hook(hook))
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
 @torch.no_grad()
 def scan_mlp_sensitivity(
     model,
@@ -661,27 +776,64 @@ def scan_mlp_sensitivity(
     fp8_args: QuantizationArgs,
     n_samples: int,
     keep_positions: int = 64,
+    context: str = "clean",
 ) -> list[LayerSensitivity]:
     """Rank decoder layers by what each format costs the model's own output.
 
-    One layer's MLP at a time is fake-quantized while every other weight stays
-    at full precision, and the model's output distribution is compared against
+    One layer's MLP at a time is fake-quantized -- weights AND input
+    activations, matching W4A4 serving -- while every other layer stays at
+    full precision, and the model's output distribution is compared against
     the untouched model by mean KL over calibration tokens. That is a direct
     measurement in the same currency the checkpoint is finally judged in.
 
-    It replaced a cheaper proxy -- activation-weighted weight reconstruction
-    error -- which turned out not to discriminate at all: on gemma-4-E2B every
-    layer scored within 11% of every other, because relative weight error is
-    mostly a property of how Gaussian a matrix is, not of what the layer does.
+    With context='quantized', the control flips: every scanned layer's MLP
+    is fake-quantized at once -- weights (BF16 originals parked in CPU
+    memory, roughly their on-disk size in host RAM) and input activations
+    -- and each trial promotes one layer back to FP8 inside that context,
+    scoring it by the whole-model KL it removes. The isolated scan asks
+    "how much damage does quantizing this layer do to a clean model?"; the
+    in-context scan asks "how much does promoting this layer repair a
+    quantized one?". context='quantized-acts' leaves weights BF16
+    everywhere and quantizes activations only, each trial toggling one
+    layer's hook to dynamic FP8, isolating the activation-format half of a
+    promotion.
+
+    Treat the non-clean contexts as diagnostics, not better rankers. They
+    were built to explain why promoting Qwen3.8's outlier-heavy last eight
+    layers (down_proj input amax 300-717 against ~30 mid-stack) measures
+    ~0.0016 lower emulated KL end to end than promoting this scan's picks
+    -- and measured on Qwen3.8, both still rank early/mid layers on top
+    and put the late outlier region near the bottom. So the late-layer
+    advantage is invisible to every minmax fake-quant trial, isolated or
+    in-context, weights or activations: it emerges only through the full
+    GPTQ pipeline, whose sequential error compensation reshapes where a
+    shipped checkpoint's residual error actually lives. On Qwen-family
+    hybrids, use --fp8-mlp gptq-loss (rank_mlp_gptq_loss below), which
+    measures error where GPTQ does and recovers the winning list exactly.
+    The in-context marginals also interact strongly -- a third of
+    layers measure negative, i.e. promoting them alone makes the
+    fully-quantized model worse through lost error cancellation -- which
+    is itself evidence that single-layer marginals in a high-error context
+    do not predict small differences between shipped checkpoints.
+
+    Activations are part of every trial because promotion changes their
+    format too: NVFP4 quantizes them group-16 under a static per-tensor
+    global scale, FP8 with dynamic per-token scales. The scan's earlier
+    proxies measured strictly worse: a weight-only trial has nothing to
+    say about activation outliers at all, and activation-weighted weight
+    reconstruction error could not separate gemma-4-E2B's layers (all
+    within 11% of each other, because relative weight error is mostly a
+    property of how Gaussian a matrix is).
 
     Three caveats on the ranking. Per-layer KL measured in isolation does not
     sum to whole-model KL, since quantization errors in different layers
     interact, so taking the top N is a greedy heuristic rather than an optimal
-    subset. Both formats are measured with plain minmax: GPTQ later claws back
-    part of the NVFP4 error on whatever stays at NVFP4, which this cannot model.
-    And the ranking is a property of the data it is measured on, which is why
-    --sensitivity-dataset exists and defaults to chat rather than to the wider
-    calibration mixture -- see GUIDE.md for the measurement behind that.
+    subset. The NVFP4 trial uses plain minmax weights: GPTQ later claws back
+    part of the NVFP4 error on whatever stays at NVFP4, which this cannot
+    model. And the ranking is a property of the data it is measured on, which
+    is why --sensitivity-dataset exists and defaults to chat rather than to
+    the wider calibration mixture -- see GUIDE.md for the measurement behind
+    that.
     """
     modules = dict(model.named_modules())
     layers: dict[str, list[str]] = {}
@@ -726,67 +878,363 @@ def scan_mlp_sensitivity(
             count += kl.numel()
         return total / count
 
-    print(
-        f"Scanning MLP sensitivity: {len(layers)} layers x 2 formats x "
-        f"{len(batches)} samples"
+    what = (
+        "activations only" if context == "quantized-acts" else "weights + activations"
     )
-    reference = [logprobs(batch).half().cpu() for batch in batches]
+    print(
+        f"Scanning MLP sensitivity: {len(layers)} layers x "
+        f"{len(batches)} samples ({context} context, {what})"
+    )
+    scanned = {name: modules[name] for names in layers.values() for name in names}
+    input_amax: dict[str, float] = {}
+    with _recorded_input_amax(scanned, input_amax):
+        reference = [logprobs(batch).half().cpu() for batch in batches]
+
+    def extra_bytes(names) -> int:
+        return sum(
+            _stored_bytes(modules[name].weight, fp8_args)
+            - _stored_bytes(modules[name].weight, nvfp4_args)
+            for name in names
+        )
 
     ranking = []
-    for position, (key, names) in enumerate(sorted(layers.items()), start=1):
-        group = {name: modules[name] for name in names}
-        with _swapped_weights(group, nvfp4_args):
-            kl_nvfp4 = mean_kl(reference)
-        with _swapped_weights(group, fp8_args):
-            kl_fp8 = mean_kl(reference)
-        extra = sum(
-            _stored_bytes(module.weight, fp8_args)
-            - _stored_bytes(module.weight, nvfp4_args)
-            for module in group.values()
+    if context != "clean":
+        ranking = _scan_in_context(
+            modules,
+            layers,
+            scanned,
+            input_amax,
+            nvfp4_args,
+            fp8_args,
+            mean_kl,
+            reference,
+            extra_bytes,
+            device,
+            quantize_weights=context == "quantized",
         )
-        ranking.append(
-            LayerSensitivity(
-                key=key,
-                index=_layer_index(key),
-                nvfp4=kl_nvfp4,
-                fp8=kl_fp8,
-                modules=tuple(sorted(names)),
-                extra_bytes=extra,
+    else:
+        for position, (key, names) in enumerate(sorted(layers.items()), start=1):
+            group = {name: modules[name] for name in names}
+            with (
+                _swapped_weights(group, nvfp4_args),
+                _quantized_activations(group, "nvfp4", input_amax),
+            ):
+                kl_nvfp4 = mean_kl(reference)
+            with (
+                _swapped_weights(group, fp8_args),
+                _quantized_activations(group, "fp8", input_amax),
+            ):
+                kl_fp8 = mean_kl(reference)
+            ranking.append(
+                LayerSensitivity(
+                    key=key,
+                    index=_layer_index(key),
+                    nvfp4=kl_nvfp4,
+                    fp8=kl_fp8,
+                    modules=tuple(sorted(names)),
+                    extra_bytes=extra_bytes(names),
+                )
             )
-        )
-        print(
-            f"  [{position}/{len(layers)}] layer {ranking[-1].index}: "
-            f"NVFP4 {kl_nvfp4:.5f}  FP8 {kl_fp8:.5f}"
-        )
+            print(
+                f"  [{position}/{len(layers)}] layer {ranking[-1].index}: "
+                f"NVFP4 {kl_nvfp4:.5f}  FP8 {kl_fp8:.5f}"
+            )
 
     ranking.sort(key=lambda layer: layer.gain, reverse=True)
     return ranking
 
 
+def _scan_in_context(
+    modules: dict,
+    layers: dict[str, list[str]],
+    scanned: dict,
+    input_amax: dict[str, float],
+    nvfp4_args: QuantizationArgs,
+    fp8_args: QuantizationArgs,
+    mean_kl,
+    reference,
+    extra_bytes,
+    device,
+    quantize_weights: bool = True,
+) -> list[LayerSensitivity]:
+    """The in-context trials behind scan_mlp_sensitivity(context != 'clean').
+
+    Baseline first: every scanned module's weight is replaced with its NVFP4
+    fake-quantized self (BF16 original parked on CPU) and gets an NVFP4
+    input-activation hook, and the whole-model KL of that state is measured.
+    Each trial then lifts one layer to FP8 -- weights re-fake-quantized from
+    the parked original, hook swapped to dynamic per-token FP8 -- remeasures,
+    and restores. A layer's LayerSensitivity carries the shared baseline as
+    `nvfp4` and its promoted KL as `fp8`, so `gain` is the promotion marginal
+    and the ranking sorts exactly as the isolated scan's does.
+
+    Without `quantize_weights` (the 'quantized-acts' context), weights are
+    untouched everywhere and the trials only toggle the activation hook, so
+    the marginal isolates the activation-format half of a promotion.
+
+    The NVFP4 activation hooks reuse the amax recorded on the clean reference
+    pass. Calibration would instead see amax under quantized-upstream drift,
+    but the drift is small in scale terms and a static global scale off by a
+    few percent changes little next to 4-bit group rounding.
+    """
+    handles: dict[str, object] = {}
+
+    def install_nvfp4_hook(name):
+        amax = input_amax.get(name, 0.0)
+        if amax <= 0:
+            return  # module never reached by the data; nothing to quantize
+        handles[name] = modules[name].register_forward_pre_hook(
+            _activation_pre_hook("nvfp4", 448.0 * 6.0 / amax)
+        )
+
+    originals: dict[str, torch.Tensor] = {}
+    ranking = []
+    try:
+        for name, module in scanned.items():
+            if quantize_weights:
+                originals[name] = module.weight.data.to("cpu")
+                module.weight.data = _fake_quant_weight(module.weight.data, nvfp4_args)
+            install_nvfp4_hook(name)
+        baseline = mean_kl(reference)
+        print(f"  all-NVFP4 baseline: KL {baseline:.5f}")
+
+        for position, (key, names) in enumerate(sorted(layers.items()), start=1):
+            held = {}
+            for name in names:
+                module = modules[name]
+                if quantize_weights:
+                    held[name] = module.weight.data
+                    module.weight.data = _fake_quant_weight(
+                        originals[name].to(device), fp8_args
+                    )
+                if name in handles:
+                    handles.pop(name).remove()
+                handles[name] = module.register_forward_pre_hook(
+                    _activation_pre_hook("fp8")
+                )
+            kl_promoted = mean_kl(reference)
+            for name in names:
+                if quantize_weights:
+                    modules[name].weight.data = held[name]
+                handles.pop(name).remove()
+                install_nvfp4_hook(name)
+            ranking.append(
+                LayerSensitivity(
+                    key=key,
+                    index=_layer_index(key),
+                    nvfp4=baseline,
+                    fp8=kl_promoted,
+                    modules=tuple(sorted(names)),
+                    extra_bytes=extra_bytes(names),
+                )
+            )
+            print(
+                f"  [{position}/{len(layers)}] layer {ranking[-1].index}: "
+                f"promoted KL {kl_promoted:.5f}  "
+                f"marginal {baseline - kl_promoted:+.5f}"
+            )
+    finally:
+        for handle in handles.values():
+            handle.remove()
+        for name, original in originals.items():
+            modules[name].weight.data = original.to(device)
+    return ranking
+
+
+@torch.no_grad()
+def rank_mlp_gptq_loss(
+    model,
+    loader: DataLoader,
+    module_names: list[str],
+    nvfp4_scheme,
+    fp8_scheme,
+    n_samples: int,
+    chunk_layers: int = 8,
+) -> list[LayerSensitivity]:
+    """Rank decoder layers by GPTQ's own per-module proxy loss.
+
+    For each MLP projection, accumulate the input Hessian from clean-model
+    calibration passes and run llm-compressor's quantize_weight under both
+    formats, keeping the loss it returns: the Hessian-weighted output MSE
+    left after GPTQ's sequential error compensation, i.e. the exact
+    quantity GPTQ minimizes. A layer's score is the sum over its
+    projections; the NVFP4-minus-FP8 difference is the predicted promotion
+    benefit.
+
+    This is the ranker that works where the KL trials above fail. On
+    Qwen3.8-27B its top eight layers are exactly the measured-best 56-63
+    promotion list, with 54 and 55 -- the amax-8 complement -- at ranks
+    nine and ten; no KL trial in scan_mlp_sensitivity recovers that list in
+    any context. It is not a depth artifact: on gemma-4-E2B the same metric
+    ranks early/mid layers on top, matching that model's known sensitivity
+    character. The NVFP4/FP8 loss ratio is nearly constant across layers
+    (~13x), so the ranking effectively measures per-layer Hessian energy --
+    the quantity output-KL toggles cannot see, because downstream layers
+    and GPTQ's own compensation absorb local error before it reaches the
+    output.
+
+    Hessians come from the model's own clean forward passes over `loader`,
+    one pass per chunk of `chunk_layers` layers to bound Hessian memory.
+    --sensitivity-context does not apply here.
+    """
+    from llmcompressor.modifiers.gptq.gptq_quantize import (
+        accumulate_hessian,
+        make_empty_hessian,
+        quantize_weight,
+    )
+    from llmcompressor.modifiers.quantization.calibration import initialize_observer
+
+    modules = dict(model.named_modules())
+    layers: dict[str, list[str]] = {}
+    for name in module_names:
+        if name in modules:
+            layers.setdefault(_layer_key(name), []).append(name)
+    if not layers:
+        return []
+
+    device = next(model.parameters()).device
+    batches = []
+    for i, batch in enumerate(loader):
+        if i >= n_samples:
+            break
+        batches.append(
+            {
+                k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
+        )
+    if not batches:
+        return []
+
+    ordered = sorted(layers, key=_layer_index)
+    print(
+        f"Ranking MLP layers by GPTQ proxy loss: {len(ordered)} layers x "
+        f"{len(batches)} samples, {chunk_layers} layers per pass"
+    )
+
+    losses: dict[str, dict[str, float]] = {}
+    for start in range(0, len(ordered), chunk_layers):
+        chunk = ordered[start : start + chunk_layers]
+        names = [name for key in chunk for name in layers[key]]
+
+        hessians: dict[str, torch.Tensor] = {}
+        counts: dict[str, torch.Tensor] = {}
+        handles = []
+
+        def make_hook(name, module):
+            def hook(_module, inputs):
+                inp = inputs[0].detach()
+                if name not in hessians:
+                    hessians[name] = make_empty_hessian(module, device=inp.device)
+                    counts[name] = torch.zeros((), device=inp.device)
+                hessians[name], counts[name] = accumulate_hessian(
+                    inp, module, hessians[name], counts[name]
+                )
+
+            return hook
+
+        for name in names:
+            handles.append(
+                modules[name].register_forward_pre_hook(make_hook(name, modules[name]))
+            )
+        try:
+            for batch in batches:
+                model(**batch)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        for name in names:
+            if name not in hessians:
+                continue
+            module = modules[name]
+            hessian = hessians.pop(name) / counts.pop(name)
+            entry = {}
+            for label, scheme in (("nvfp4", nvfp4_scheme), ("fp8", fp8_scheme)):
+                module.quantization_scheme = scheme
+                initialize_observer(module, "weight")
+                module.weight_observer(module.weight)
+                # quantize_weight consumes the Hessian in place; clone for
+                # the first format so the second sees the real one.
+                h = hessian.clone() if label == "nvfp4" else hessian
+                loss, _ = quantize_weight(
+                    module=module,
+                    quant_args=scheme.weights,
+                    hessian=h,
+                    blocksize=128,
+                    percdamp=0.01,
+                )
+                entry[label] = loss
+                del module.weight_observer
+                del module.quantization_scheme
+            losses[name] = entry
+        for position, key in enumerate(chunk, start=start + 1):
+            done = [n for n in layers[key] if n in losses]
+            print(
+                f"  [{position}/{len(ordered)}] layer {_layer_index(key)}: "
+                f"NVFP4 {sum(losses[n]['nvfp4'] for n in done):.4g}  "
+                f"FP8 {sum(losses[n]['fp8'] for n in done):.4g}"
+            )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    ranking = []
+    for key in ordered:
+        done = [n for n in layers[key] if n in losses]
+        if not done:
+            continue
+        ranking.append(
+            LayerSensitivity(
+                key=key,
+                index=_layer_index(key),
+                nvfp4=sum(losses[n]["nvfp4"] for n in done),
+                fp8=sum(losses[n]["fp8"] for n in done),
+                modules=tuple(sorted(done)),
+                extra_bytes=sum(
+                    _stored_bytes(modules[n].weight, fp8_scheme.weights)
+                    - _stored_bytes(modules[n].weight, nvfp4_scheme.weights)
+                    for n in done
+                ),
+            )
+        )
+    ranking.sort(key=lambda layer: layer.gain, reverse=True)
+    return ranking
+
+
 def print_sensitivity_table(
-    ranking: list[LayerSensitivity], promoted: set[str] | None = None
+    ranking: list[LayerSensitivity],
+    promoted: set[str] | None = None,
+    metric: str = "KL",
 ) -> None:
     """Print the ranking most-sensitive first, marking the promoted layers."""
     promoted = promoted or set()
+    # KL values live in a narrow decade; GPTQ losses span several, so they
+    # get significant digits instead of fixed decimals.
+    spec = ".5f" if metric == "KL" else ".4g"
     print(
-        f"\n{'rank':>4} {'layer':>6} {'NVFP4 KL':>10} {'FP8 KL':>9} "
+        f"\n{'rank':>4} {'layer':>6} {f'NVFP4 {metric}':>10} {f'FP8 {metric}':>9} "
         f"{'gain':>9} {'+MiB':>7}"
     )
     for rank, layer in enumerate(ranking, start=1):
         mark = " <- FP8" if layer.key in promoted else ""
         print(
-            f"{rank:>4} {layer.index:>6} {layer.nvfp4:>10.5f} {layer.fp8:>9.5f} "
-            f"{layer.gain:>9.5f} {layer.extra_bytes / 1024**2:>7.1f}{mark}"
+            f"{rank:>4} {layer.index:>6} {layer.nvfp4:>10{spec}} "
+            f"{layer.fp8:>9{spec}} {layer.gain:>9{spec}} "
+            f"{layer.extra_bytes / 1024**2:>7.1f}{mark}"
         )
 
 
 def write_sensitivity_report(
-    path: Path, ranking: list[LayerSensitivity], promoted: set[str]
+    path: Path,
+    ranking: list[LayerSensitivity],
+    promoted: set[str],
+    metric: str = "kl",
 ) -> None:
     """Dump the full ranking as JSON so a selection can be revisited later."""
     path.write_text(
         json.dumps(
             {
+                "metric": metric,
                 "promoted_layers": sorted(
                     layer.index for layer in ranking if layer.key in promoted
                 ),
@@ -794,8 +1242,8 @@ def write_sensitivity_report(
                     {
                         "index": layer.index,
                         "key": layer.key,
-                        "nvfp4_kl": layer.nvfp4,
-                        "fp8_kl": layer.fp8,
+                        f"nvfp4_{metric}": layer.nvfp4,
+                        f"fp8_{metric}": layer.fp8,
                         "gain": layer.gain,
                         "extra_bytes": layer.extra_bytes,
                         "promoted": layer.key in promoted,
@@ -1090,13 +1538,18 @@ def parse_args():
         help="Keep the most quantization-sensitive dense MLP layers at FP8 "
         "instead of NVFP4, trading size for fidelity. 'off' (default) is "
         "uniform NVFP4. 'top:N' promotes the N layers with the largest "
-        "NVFP4-over-FP8 KL against the unquantized model. An explicit list "
-        "like '1,2,3,10-15,19' promotes exactly those decoder layers. 'scan' "
-        "prints the full sensitivity ranking and exits without quantizing. "
-        "top:N and scan need calibration data, so they cannot be combined "
-        "with --weight-only; an explicit list can. Promotion is always "
-        "whole-layer, because vLLM fuses gate_proj and up_proj into one "
-        "module that can only carry one scheme.",
+        "NVFP4-over-FP8 KL against the unquantized model. 'gptq-loss:N' "
+        "ranks by GPTQ's own per-layer proxy loss instead (Hessian-weighted "
+        "output MSE, the quantity GPTQ minimizes) -- the ranker that "
+        "recovers the measured late-layer promotion advantage on Qwen-family "
+        "hybrids where every KL trial misses it, and the recommended ranked "
+        "mode there. An explicit list like '1,2,3,10-15,19' promotes exactly "
+        "those decoder layers. 'scan' and 'gptq-loss' print their full "
+        "ranking and exit without quantizing. The ranked modes need "
+        "calibration data, so they cannot be combined with --weight-only; an "
+        "explicit list can. Promotion is always whole-layer, because vLLM "
+        "fuses gate_proj and up_proj into one module that can only carry one "
+        "scheme.",
     )
     p.add_argument(
         "--sensitivity-samples",
@@ -1112,6 +1565,24 @@ def parse_args():
         default=None,
         metavar="PATH",
         help="Write the full --fp8-mlp sensitivity ranking to PATH as JSON.",
+    )
+    p.add_argument(
+        "--sensitivity-context",
+        choices=["clean", "quantized", "quantized-acts"],
+        default="clean",
+        help="What the rest of the model looks like during each --fp8-mlp "
+        "trial. 'clean' (default) fake-quantizes one layer at a time against "
+        "an otherwise-BF16 model. 'quantized' fake-quantizes every dense MLP "
+        "layer at once (weights and activations; the BF16 originals are "
+        "parked in CPU memory, roughly their on-disk size in host RAM) and "
+        "scores each layer by the KL its FP8 promotion removes from that "
+        "baseline. 'quantized-acts' quantizes activations only, isolating "
+        "the activation-format half of each promotion. The non-clean modes "
+        "are diagnostics: on Qwen3.8 neither reproduces the measured "
+        "late-layer promotion advantage (it emerges only through the GPTQ "
+        "pipeline), so on Qwen-family hybrids pass an explicit late-layer "
+        "list instead of trusting any scan mode -- see the Mixed-precision "
+        "MLP section of GUIDE.md.",
     )
     p.add_argument(
         "--int8-ple",
@@ -1248,29 +1719,44 @@ def main():
 
     # --fp8-mlp resolves to a mode now and to concrete module names once the
     # model (and, for the ranked modes, the calibration data) is loaded.
+    # 'gptq-loss' and 'gptq-loss:N' share the scan/top plumbing and differ
+    # only in the ranker behind the table.
     fp8_mlp_mode, fp8_mlp_top, fp8_mlp_indices = "off", 0, set()
-    if args.fp8_mlp == "scan":
+    fp8_mlp_ranker, fp8_spec = "kl", args.fp8_mlp
+    if fp8_spec == "gptq-loss" or fp8_spec.startswith("gptq-loss:"):
+        fp8_mlp_ranker = "gptq"
+        fp8_spec = (
+            "scan"
+            if fp8_spec == "gptq-loss"
+            else "top:" + fp8_spec[len("gptq-loss:") :]
+        )
+    if fp8_spec == "scan":
         fp8_mlp_mode = "scan"
-    elif args.fp8_mlp.startswith("top:"):
+    elif fp8_spec.startswith("top:"):
         fp8_mlp_mode = "top"
         try:
-            fp8_mlp_top = int(args.fp8_mlp[len("top:") :])
+            fp8_mlp_top = int(fp8_spec[len("top:") :])
         except ValueError:
             raise SystemExit(
                 f"--fp8-mlp: {args.fp8_mlp!r} is not a number of layers. "
-                "Expected 'top:N', e.g. 'top:12'."
+                "Expected 'top:N' or 'gptq-loss:N', e.g. 'top:12'."
             ) from None
         if fp8_mlp_top < 0:
             raise SystemExit(f"--fp8-mlp top:N needs N >= 0, got {fp8_mlp_top}")
-    elif args.fp8_mlp != "off":
+    elif fp8_spec != "off":
         fp8_mlp_mode = "explicit"
         fp8_mlp_indices = parse_layer_spec(args.fp8_mlp)
 
     if fp8_mlp_mode in ("scan", "top") and args.weight_only:
         raise SystemExit(
-            "--fp8-mlp scan and top:N rank layers by running data through the "
-            "model, which needs the calibration pass --weight-only skips. Pass "
-            "an explicit layer list instead."
+            "--fp8-mlp scan, top:N and gptq-loss rank layers by running data "
+            "through the model, which needs the calibration pass --weight-only "
+            "skips. Pass an explicit layer list instead."
+        )
+    if fp8_mlp_ranker == "gptq" and args.sensitivity_context != "clean":
+        raise SystemExit(
+            "--fp8-mlp gptq-loss accumulates Hessians from clean-model inputs; "
+            "--sensitivity-context does not apply to it."
         )
 
     mode = "W4A16 (weight-only)" if args.weight_only else "W4A4 (weights + activations)"
@@ -1295,7 +1781,12 @@ def main():
         print(f"Calibration: {args.samples} samples, max {args.max_len} tokens each")
         print(f"Dataset:     {args.dataset}")
         if fp8_mlp_mode in ("scan", "top"):
-            print(f"Ranked on:   {args.sensitivity_dataset}")
+            how = (
+                "GPTQ proxy loss"
+                if fp8_mlp_ranker == "gptq"
+                else f"{args.sensitivity_context} context"
+            )
+            print(f"Ranked on:   {args.sensitivity_dataset} ({how})")
         if args.vision_samples != "auto":
             try:
                 args.vision_samples = int(args.vision_samples)
@@ -1491,17 +1982,28 @@ def main():
             fp8_mlp_modules = sorted(n for i in fp8_mlp_indices for n in by_index[i])
             print(f"FP8 MLP:     layers {sorted(fp8_mlp_indices)} (explicit)")
         else:
-            ranking = scan_mlp_sensitivity(
-                model,
-                scan_ds,
-                mlp_modules,
-                preset_name_to_scheme("NVFP4", ["Linear"]).weights,
-                preset_name_to_scheme("FP8_DYNAMIC", ["Linear"]).weights,
-                args.sensitivity_samples,
-            )
+            if fp8_mlp_ranker == "gptq":
+                ranking = rank_mlp_gptq_loss(
+                    model,
+                    scan_ds,
+                    mlp_modules,
+                    preset_name_to_scheme("NVFP4", ["Linear"]),
+                    preset_name_to_scheme("FP8_DYNAMIC", ["Linear"]),
+                    args.sensitivity_samples,
+                )
+            else:
+                ranking = scan_mlp_sensitivity(
+                    model,
+                    scan_ds,
+                    mlp_modules,
+                    preset_name_to_scheme("NVFP4", ["Linear"]).weights,
+                    preset_name_to_scheme("FP8_DYNAMIC", ["Linear"]).weights,
+                    args.sensitivity_samples,
+                    context=args.sensitivity_context,
+                )
             if not ranking:
                 raise SystemExit(
-                    "--fp8-mlp: the sensitivity scan observed no activations, so "
+                    "--fp8-mlp: the ranking pass observed no activations, so "
                     "the calibration forward pass reached none of the MLP "
                     "projections. Nothing to rank."
                 )
@@ -1512,13 +2014,20 @@ def main():
                     "of them, which is plain FP8 with extra steps."
                 )
             promoted = {layer.key for layer in ranking[:fp8_mlp_top]}
-            print_sensitivity_table(ranking, promoted)
+            print_sensitivity_table(
+                ranking,
+                promoted,
+                metric="loss" if fp8_mlp_ranker == "gptq" else "KL",
+            )
             if args.sensitivity_report:
                 write_sensitivity_report(
-                    Path(args.sensitivity_report), ranking, promoted
+                    Path(args.sensitivity_report),
+                    ranking,
+                    promoted,
+                    metric="gptq_loss" if fp8_mlp_ranker == "gptq" else "kl",
                 )
             if fp8_mlp_mode == "scan":
-                print("\n--fp8-mlp scan: ranking only, nothing quantized.")
+                print(f"\n--fp8-mlp {args.fp8_mlp}: ranking only, nothing quantized.")
                 return
             chosen = [layer for layer in ranking if layer.key in promoted]
             fp8_mlp_modules = sorted(n for layer in chosen for n in layer.modules)

@@ -3,7 +3,7 @@
 End-to-end walkthrough: quantize a model to NVFP4 and serve it with vLLM.
 
 **Hardware used:** NVIDIA RTX PRO 6000 Blackwell Workstation (SM 12.0, 96 GB VRAM)
-**Confirmed working:** vLLM 0.25.1, torch 2.11.0+cu130, llmcompressor 0.12.0
+**Confirmed working:** vLLM 0.27.1, torch 2.13.0+cu130, llmcompressor 0.12.0
 
 ---
 
@@ -59,10 +59,17 @@ sudo apt-get install -y python3.12-dev gcc
 ### Python environment
 
 Dependencies are managed via `pyproject.toml` with exact pins for the core stack
-(vLLM 0.25.1, llmcompressor 0.12.0, transformers 5.10.1). One quirk: vLLM 0.25.1
-pins `compressed-tensors==0.17.0` while llmcompressor 0.12.0 pins `==0.17.1`, so the
-`[tool.uv]` section uses `override-dependencies` to force the newer patch release —
-without it the two packages cannot resolve together.
+(vLLM 0.27.1, llmcompressor 0.12.0, transformers 5.10.1). Two quirks: vLLM 0.27.1
+pins `compressed-tensors==0.17.0` while llmcompressor 0.12.0 pins `==0.17.1`, and
+vLLM's `torch==2.13.0` sits above llmcompressor's conservative `<=2.12.0` cap, so
+the `[tool.uv]` section uses `override-dependencies` for both — without it the
+packages cannot resolve together.
+
+For hybrid linear-attention models (Qwen3.5/3.6/3.8), the optional
+`fast-calib` extra installs `flash-linear-attention` and `causal-conv1d` so
+Gated DeltaNet calibration doesn't run on transformers' slow torch fallback.
+`causal-conv1d` builds from source and needs nvcc on PATH (see the CUDA
+toolkit note below): `uv sync --extra fast-calib`.
 
 ```bash
 # Create a Python 3.12 virtual environment and install all dependencies
@@ -77,8 +84,8 @@ python -c "import vllm; print(vllm.__version__)"
 
 Expected output:
 ```
-2.11.0+cu130 True
-0.25.1
+2.13.0+cu130 True
+0.27.1
 ```
 
 ---
@@ -307,6 +314,26 @@ coverage is free.
 Set them equal if you have a reason to (`--sensitivity-dataset mix`), and the
 run builds one corpus instead of two.
 
+### FP8 DeltaNet (hybrid linear-attention models)
+
+Hybrid Qwen models (3.5/3.6/3.8) replace attention with a Gated DeltaNet
+recurrence in three of every four layers. Those `linear_attn` projections
+quantize to NVFP4 by default, and pay for it: on Qwen3.6-27B, DeltaNet at
+NVFP4 costs about +0.0045 weight-only KL versus leaving it at higher
+precision — roughly half the total quantization error of the checkpoint.
+
+```bash
+python quantize.py --model Qwen/Qwen3.6-27B --fp8-deltanet
+```
+
+`--fp8-deltanet` keeps `in_proj_qkv`, `in_proj_z`, and `out_proj` at FP8
+(channel-wise weights, dynamic per-token activations — the same scheme as
+`--fp8-attn`) for about +1.5 GB on a 27B. The tiny `in_proj_a`/`in_proj_b`
+gating projections stay unquantized either way, and the flag is a no-op on
+models without `linear_attn` modules. FP8's per-channel scales also ride
+through vLLM's `in_proj_qkvz` fusion without the requantize-to-min-scale
+step NVFP4's per-tensor global scales trigger at load.
+
 ### Per-layer embeddings (Gemma 4 E-series)
 
 The E-series carries a second embedding table, `embed_tokens_per_layer`, that
@@ -426,6 +453,7 @@ The original FP16 model is ~950 MB — roughly 2× smaller for W4A4.
 | `--samples` | `512` | Calibration samples (more = better accuracy) |
 | `--max-len` | `1024` | Max tokens per calibration sample |
 | `--weight-only` | off | Use W4A16 instead of W4A4 |
+| `--fp8-deltanet` | off | Keep Gated DeltaNet projections at FP8 on hybrid models. See [FP8 DeltaNet](#fp8-deltanet-hybrid-linear-attention-models) |
 | `--fp8-mlp` | `off` | Keep the most quantization-sensitive MLP layers at FP8. See [Mixed-precision MLP](#mixed-precision-mlp) |
 | `--sensitivity-dataset` | `ultrachat` | Data the `--fp8-mlp` ranking is measured on. Defaults differently from `--dataset` deliberately — see [Mixed-precision MLP](#mixed-precision-mlp) |
 | `--sensitivity-samples` | `64` | Calibration samples the `--fp8-mlp` ranking measures KL over |
@@ -465,6 +493,12 @@ python serve.py --tool-call-parser gemma4 --enable-auto-tool-choice
 
 # Speculative decoding:
 python serve.py --speculative-config '{"draft_model": "org/small-model", "num_speculative_tokens": 5}'
+
+# MTP speculative decoding for checkpoints that ship an mtp.* head
+# (Qwen3.5/3.6/3.8). Use the generic "mtp" method — vLLM 0.27 resolves it
+# to the Qwen3_5MTP draft arch via model_type, and warns that spelling it
+# "qwen3_5_mtp" is deprecated:
+python serve.py --model ./Qwen3.6-27B-NVFP4 --speculative-config '{"method": "mtp", "num_speculative_tokens": 1}'
 ```
 
 By default vLLM reserves 90% of VRAM (~86 GB on this card) for the model and KV
@@ -492,6 +526,7 @@ cache blocks pre-allocated to avoid fragmentation at runtime. Use
 | `--kv-cache-dtype` | `auto` | KV cache dtype: auto, fp8, fp8_e5m2, fp8_e4m3 |
 | `--linear-backend` | auto (`cutlass` if nvcc missing) | Force the GEMM kernel backend (e.g. `cutlass`, `marlin`, `flashinfer_cutlass`) |
 | `--moe-backend` | auto (`cutlass` if nvcc missing) | Force the fused-MoE kernel backend (e.g. `cutlass`, `marlin`, `flashinfer_cutlass`) |
+| `--attention-backend` | auto (`TRITON_ATTN` if nvcc missing) | Force the attention backend (e.g. `FLASHINFER`, `TRITON_ATTN`); FlashInfer JIT-compiles with nvcc at startup |
 | `--enforce-eager` | off | Disable CUDA graph compilation (useful for debugging) |
 | `--enable-prefix-caching` | off | Enable KV cache reuse across requests with shared prefixes |
 | `--speculative-config` | none | JSON string or file path for speculative decoding config |
@@ -652,13 +687,26 @@ dies with:
 RuntimeError: Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist
 ```
 The same applies to vLLM's fused-MoE NVFP4 backend (auto-selection prefers
-`FLASHINFER_CUTLASS`, which dies the same way during the startup profile run)
-and to the default top-k/top-p sampler, which also comes from FlashInfer.
-`serve.py` handles all three with one check: when nvcc is not found it
-defaults to `--linear-backend cutlass` and `--moe-backend cutlass` (vLLM's
-built-in kernels, no JIT) and sets `VLLM_USE_FLASHINFER_SAMPLER=0`; with the
-CUDA toolkit installed, vLLM auto-selects freely, FlashInfer backends
-included.
+`FLASHINFER_CUTLASS`, which dies the same way during the startup profile run),
+to the default top-k/top-p sampler, which also comes from FlashInfer, and —
+since vLLM 0.27 — to the attention backend itself: on Blackwell the selector
+prefers `FLASHINFER`, whose batch prefill/decode modules JIT-compile during
+the first metadata build (the error surfaces mid-startup from
+`flashinfer/jit/core.py`).
+`serve.py` handles all four with one check: when nvcc is not found it
+defaults to `--linear-backend cutlass`, `--moe-backend cutlass`, and
+`--attention-backend TRITON_ATTN` (vLLM's built-in kernels, no JIT) and sets
+`VLLM_USE_FLASHINFER_SAMPLER=0`; with the CUDA toolkit installed, vLLM
+auto-selects freely, FlashInfer backends included.
+
+One subtlety: with `--speculative-config`, vLLM deliberately does **not**
+inherit `--attention-backend` for the draft model — it re-autoselects
+(preferring FlashInfer) unless the speculative config JSON names an
+`attention_backend` itself. The failure is nasty because the JIT compile is
+deferred to the first request: startup completes, then the engine dies on
+the first generation. serve.py injects
+`"attention_backend": "TRITON_ATTN"` into the speculative config when nvcc
+is missing.
 
 ### Silent fallback kills performance
 A misconfigured model can run in dequantization mode (loads weights as FP4,
@@ -758,6 +806,28 @@ full-model forwards instead. Two consequences:
   `Applying/Gathering ...` phases in the log is expected there. Confirm the
   statistics survived by checking the log has no
   `Falling back to uniform MSE` warnings.
+
+### Hybrid linear-attention models (Qwen3.5/3.6/3.8)
+
+Hybrid checkpoints interleave Gated DeltaNet `linear_attn` layers with
+ordinary `self_attn` layers (3:1 on Qwen3.5-family). All five DeltaNet
+projections are plain `nn.Linear`, but with `--gptq-mlp on` the recipe drops
+the catch-all Linear group and neither surviving regex (self_attn FP8, `.mlp`
+GPTQ) matches `linear_attn.*` — which silently left every DeltaNet projection
+at BF16 (a 25% size penalty on Qwen3.6-27B). `quantize.py` now detects
+`linear_attn` modules in the live tree and adds an explicit NVFP4 group for
+`in_proj_qkv`/`in_proj_z`/`out_proj`, leaving the tiny `in_proj_a`/`in_proj_b`
+decay/beta gating projections unquantized (unsloth's split). The split aligns
+with vLLM's weight fusion — `in_proj_qkvz` fuses qkv+z, `in_proj_ba` fuses
+b+a, and vLLM requires every component of a fused module to resolve to the
+same scheme — so don't move one projection across the line without moving its
+fusion partner.
+
+Two serving notes for hybrids: the Mamba-style recurrent state is allocated
+per sequence, so `--max-num-seqs` must be at or below the reported cache
+block count (64 works on Qwen3.6-27B; the 1024 default does not), and the
+checkpoint's `mtp.*` head enables MTP speculative decoding (see the
+speculative decoding example above).
 
 ### Checkpoint heads transformers doesn't implement
 Some checkpoints ship auxiliary weights that upstream transformers has no

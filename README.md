@@ -34,6 +34,7 @@ python chat.py
 | Script | Description |
 |--------|-------------|
 | [`quantize.py`](quantize.py) | Quantize any HuggingFace model to NVFP4 (W4A4 or W4A16) |
+| [`verify.py`](verify.py) | Check a quantized checkpoint for silent corruption (bit flips) |
 | [`serve.py`](serve.py) | Start an OpenAI-compatible vLLM server |
 | [`chat.py`](chat.py) | Interactive terminal chat client |
 
@@ -49,6 +50,7 @@ python chat.py
 | `--max-len` | `1024` | Max tokens per calibration sample |
 | `--weight-only` | off | W4A16 mode (no calibration data needed) |
 | `--fp8-attn` | on | Keep attention q/k/v/o projections at FP8 and calibrate an FP8 KV cache scale (KV scale skipped with `--weight-only`); disable with `--no-fp8-attn` for uniform NVFP4 |
+| `--fp8-deltanet` | off | On hybrid linear-attention models, keep the Gated DeltaNet qkv/z/out projections at FP8 instead of NVFP4 (~+1.5GB on a 27B for most of the DeltaNet quantization KL back); no effect elsewhere |
 | `--gptq-mlp` | `auto` | Quantize dense MLP gate/up/down projections with GPTQ error compensation (imatrix_mse observer + static actorder): same on-disk format and serving cost, ~20% lower KL vs the BF16 original. `auto` enables it for dense models and skips MoE, `--weight-only`, and `--no-fp8-attn` runs; `on`/`off` force it |
 | `--fp8-mlp` | `off` | Keep the most quantization-sensitive dense MLP layers at FP8 instead of NVFP4, trading size for fidelity. `top:N` picks the N layers whose NVFP4-over-FP8 KL against the unquantized model is largest, an explicit list like `1,2,3,10-15` names them outright, and `scan` prints the [ranking](GUIDE.md#mixed-precision-mlp) and exits |
 | `--sensitivity-dataset` | `ultrachat` | Data the `--fp8-mlp` ranking is measured on. Deliberately not the same default as `--dataset`: ranking layers on the wide mixture [picks measurably worse layers](GUIDE.md#why-the-scan-uses-a-different-corpus-than-calibration) |
@@ -63,6 +65,21 @@ python chat.py
 | `--vision-samples` | `auto` | Share of `--samples` that carry an image. `auto` = 12.5% when the checkpoint has an image processor, 0 otherwise |
 | `--split` | auto | Dataset split (`train_sft` for ultrachat, `train` otherwise); ignored for multi-source mixtures |
 | `--cpu-offload` | off | Load model to system RAM; llm-compressor dispatches layers to GPU during calibration (use for large MoE models) |
+
+### verify.py
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model` | required | Quantized checkpoint directory to verify |
+| `--orig` | none | Source checkpoint (path or HF ID) the quantization ran from; enables the byte-identity and weight-deviation checks |
+| `--quick` | off | Skip the weight-deviation scan (the slow check) |
+
+Checks that pass-through tensors are byte-identical to the source, that
+global/KV scales are finite, that block scales have no extreme outliers,
+and that dequantized weights sit within the expected quantization error of
+the source weights. Catches sign- and exponent-bit flips; a flip smaller
+than ~2 scale-units is inside normal quantization noise (and equally
+harmless). Exits non-zero on findings.
 
 ### serve.py
 
@@ -83,6 +100,7 @@ python chat.py
 | `--quantization` | auto | Force backend (use `modelopt` for NVIDIA pre-quantized checkpoints) |
 | `--kv-cache-dtype` | `auto` | KV cache dtype: auto, fp8, fp8_e5m2, fp8_e4m3 |
 | `--linear-backend` | auto (`cutlass` if nvcc missing) | Force the GEMM kernel backend (e.g. `cutlass`, `marlin`, `flashinfer_cutlass`) |
+| `--attention-backend` | auto (`TRITON_ATTN` if nvcc missing) | Force the attention backend (e.g. `FLASHINFER`, `TRITON_ATTN`); FlashInfer JIT-compiles with nvcc at startup |
 | `--enforce-eager` | off | Disable CUDA graph compilation (useful for debugging) |
 | `--enable-prefix-caching` | off | Enable KV cache reuse across requests with shared prefixes |
 | `--speculative-config` | none | JSON string or file path for speculative decoding config |

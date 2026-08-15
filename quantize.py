@@ -15,7 +15,7 @@ unquantized — automatic, keyed off the live module tree.
 Usage:
     python quantize.py [--model MODEL_ID] [--output OUTPUT_DIR]
                        [--samples N] [--max-len N] [--weight-only]
-                       [--no-fp8-attn] [--fp8-deltanet]
+                       [--no-fp8-attn] [--fp8-deltanet] [--fp8-lm-head]
                        [--gptq-mlp {auto,on,off}]
                        [--fp8-mlp SPEC] [--sensitivity-samples N]
                        [--sensitivity-report PATH]
@@ -35,6 +35,10 @@ Defaults:
     fp8-deltanet = False (NVFP4 DeltaNet projections on hybrid models;
                  set the flag to keep them at FP8 instead — ~+1.5GB on a
                  27B for most of the DeltaNet quantization KL back)
+    fp8-lm-head = False (output head stays at model dtype; set the flag to
+                 quantize it to FP8 and take it off the ignore list — half
+                 the head's bytes, worth +14% decode throughput at k=2 MTP
+                 against 1.7 points of draft acceptance)
     gptq-mlp   = auto (GPTQ + imatrix_mse observer + static actorder on
                  dense MLP gate/up/down projections; calibration-only, same
                  on-disk format, ~20% lower KL vs BF16 than plain minmax.
@@ -57,7 +61,7 @@ Defaults:
                  promotion against an all-MLP-quantized baseline instead,
                  and 'quantized-acts' quantizes activations only -- both
                  diagnostics, not better default rankers)
-    ignore     = lm_head
+    ignore     = lm_head (dropped automatically by --fp8-lm-head)
     dtype      = auto
     dataset    = mix (chat + instruct + code + math + multilingual + tool
                  calls + raw web text, streamed from seven HuggingFace
@@ -166,12 +170,18 @@ DELTANET_IGNORE = (
     r"re:.*linear_attn\.in_proj_b$",
 )
 
+# The output head, promoted from BF16 to FP8 by --fp8-lm-head. It is a plain
+# Linear, so the only thing keeping it unquantized is the default ignore list;
+# the flag drops it from there and gives it a group of its own.
+LM_HEAD_TARGET = r"re:.*lm_head$"
+
 # The Gemma-4 E-series per-layer embedding table, quantized to INT8 by
 # --int8-ple. It is a lookup table, not a matmul, so this is weight-only; vLLM
 # unpacks only the gathered rows (CompressedTensorsEmbeddingWNA16Int), which
 # makes the saving VRAM as well as disk. The trailing "_per_layer" keeps this
 # off the ordinary embed_tokens table, which is not a candidate: it is read
-# through lm_head, and lm_head is on the ignore list.
+# through lm_head, which is on the ignore list unless --fp8-lm-head takes it
+# off (and even then the table itself stays at model dtype).
 PLE_TARGET = r"re:.*embed_tokens_per_layer$"
 
 
@@ -1517,6 +1527,19 @@ def parse_args():
         "linear_attn modules.",
     )
     p.add_argument(
+        "--fp8-lm-head",
+        action="store_true",
+        help="Quantize the output head to FP8 (channel-wise weights, dynamic "
+        "per-token activations) instead of leaving it at model dtype, and drop "
+        "it from --ignore. The head is one of the largest tensors left in an "
+        "NVFP4 checkpoint (2.4 GiB of Qwen3.8-27B's 23 GB) and single-stream "
+        "decode reads all of it once per lm_head pass — three times per step "
+        "under k=2 MTP, which shares the head with the draft. Measured on "
+        "Qwen3.8-27B against a checkpoint differing in this tensor alone: "
+        "+14%% decode throughput at k=2 (+4.5%% with speculation off), for "
+        "1.7 points of draft acceptance and +0.0005 weight-only KL.",
+    )
+    p.add_argument(
         "--gptq-mlp",
         choices=["auto", "on", "off"],
         default="auto",
@@ -1759,6 +1782,14 @@ def main():
             "--sensitivity-context does not apply to it."
         )
 
+    # --fp8-lm-head takes the head off the ignore list. Done here rather than
+    # after the model loads so the status header below prints the ignore list
+    # the run actually uses; the live module tree is checked once it exists.
+    if args.fp8_lm_head:
+        args.ignore = [
+            pattern for pattern in args.ignore if not match_name("lm_head", pattern)
+        ]
+
     mode = "W4A16 (weight-only)" if args.weight_only else "W4A4 (weights + activations)"
     if args.fp8_attn:
         mode += " + FP8 attention"
@@ -1768,6 +1799,8 @@ def main():
         mode += " + GPTQ MLP"
     if fp8_mlp_mode != "off":
         mode += f" + FP8 MLP fallback ({args.fp8_mlp})"
+    if args.fp8_lm_head:
+        mode += " + FP8 lm_head"
     if args.int8_ple == "on":
         # "auto" is reported once the module tree says whether it applies.
         mode += " + INT8 PLE"
@@ -1844,6 +1877,44 @@ def main():
             "architecture likely fuses QKV or uses MLA naming. Rerun with "
             "--no-fp8-attn or adjust FP8_ATTN_TARGET."
         )
+
+    # --fp8-lm-head resolves against the live module tree for the same reason
+    # --fp8-attn does: an architecture that names its head differently should
+    # say so rather than quietly produce a checkpoint without the promotion.
+    lm_head_modules: list[str] = []
+    if args.fp8_lm_head:
+        lm_head_modules = sorted(
+            name
+            for name, module in model.named_modules()
+            if isinstance(module, torch.nn.Linear) and match_name(name, LM_HEAD_TARGET)
+        )
+        if not lm_head_modules:
+            raise SystemExit(
+                f"--fp8-lm-head matched no Linear module ({LM_HEAD_TARGET!r}); "
+                "this architecture names its output head differently."
+            )
+        conflicting = [
+            name
+            for name in lm_head_modules
+            if any(match_name(name, pattern) for pattern in args.ignore)
+        ]
+        if conflicting:
+            raise SystemExit(
+                f"--fp8-lm-head conflicts with --ignore: {', '.join(conflicting)} "
+                "is excluded from quantization. Drop the pattern covering it."
+            )
+        if getattr(model.config.get_text_config(), "tie_word_embeddings", False):
+            raise SystemExit(
+                "--fp8-lm-head: this model ties lm_head to embed_tokens, so the "
+                "head and the input embedding table are the same tensor and "
+                "quantizing one quantizes the other. vLLM reads the table with a "
+                "gather kernel that takes weight-only INT group/channel and "
+                "nothing else, so the result would not load."
+            )
+        # BF16 -> FP8 halves the weight; the per-row scales are one BF16 value
+        # per vocab entry, which rounds to nothing beside it.
+        saved = sum(model.get_submodule(n).weight.nbytes for n in lm_head_modules) // 2
+        print(f"FP8 lm_head: {', '.join(lm_head_modules)} (-{saved / 1024**2:.0f} MiB)")
 
     # Hybrid linear-attention models get an explicit DeltaNet group so the
     # projections survive --gptq-mlp deleting the catch-all Linear group.
@@ -2044,6 +2115,27 @@ def main():
         if args.weight_only:
             fp8_mlp_scheme.input_activations = None
         config_groups["group_3"] = fp8_mlp_scheme
+
+    if lm_head_modules:
+        # The regex, not the resolved module names — the opposite of the FP8 MLP
+        # group above, and it matters. vLLM rewrites exact-name targets through
+        # the model's hf_to_vllm_mapper before matching (apply_vllm_mapper), and
+        # those mappers are prefix rules with a trailing dot: Qwen3-VL maps
+        # "model.language_model." -> "language_model.model.", which fixes up the
+        # MLP names, but its head rule is "lm_head." -> "language_model.lm_head."
+        # and a bare "lm_head" target has no trailing dot to match. It survives
+        # unrewritten, then fails to equal the real prefix "language_model.lm_head",
+        # so vLLM builds an unquantized ParallelLMHead and the load dies on the
+        # unexpected lm_head.weight_scale. Regex targets are passed through
+        # untouched by that mapper and matched with re.match, so they hit the
+        # head whatever the wrapper prefixes it with. Still outranks the
+        # catch-all Linear group at both ends: compressed-tensors resolves regex
+        # before class-name targets, and vLLM only falls back to class names
+        # after the layer-name pass fails.
+        lm_head_scheme = preset_name_to_scheme("FP8_DYNAMIC", [LM_HEAD_TARGET])
+        if args.weight_only:
+            lm_head_scheme.input_activations = None
+        config_groups["group_6"] = lm_head_scheme
 
     if ple_modules:
         # Weight-only: an embedding is a gather, not a matmul, so there is no

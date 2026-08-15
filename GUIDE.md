@@ -398,6 +398,95 @@ models without `linear_attn` modules. FP8's per-channel scales also ride
 through vLLM's `in_proj_qkvz` fusion without the requantize-to-min-scale
 step NVFP4's per-tensor global scales trigger at load.
 
+### FP8 output head
+
+The recipe leaves `lm_head` at model dtype, because it is on the default
+`--ignore` list. On a large-vocab model that makes it the biggest single
+tensor in the checkpoint: Qwen3.8-27B's head is 248320 x 5120, or 2.37 GiB
+of a 23 GB NVFP4 checkpoint. `--fp8-lm-head` drops it from `--ignore` and
+gives it an FP8 group of its own — channel-wise weights, dynamic per-token
+activations, the same scheme `--fp8-attn` uses — halving it to 1.18 GiB plus
+a per-row BF16 scale.
+
+```bash
+python quantize.py --model Qwen/Qwen3.8-27B --fp8-deltanet \
+  --fp8-mlp gptq-loss:8 --fp8-lm-head
+```
+
+**This is a latency flag, not a size flag.** Single-stream decode is
+bandwidth-bound, so what matters is that every decode step reads the whole
+head once — and under MTP speculative decoding it reads it once per draft
+position too, because the MTP head shares `lm_head` with the target. At k=2
+that is three passes per step, over a tensor that is a tenth of the model.
+
+Measured on Qwen3.8-27B, comparing two checkpoints that differ in exactly one
+tensor — same box, same vLLM 0.27.1 process flags, both served through
+`serve.py` with `--kv-cache-dtype fp8 --gpu-memory-utilization 0.85
+--max-model-len 262144 --max-num-seqs 64 --max-num-batched-tokens 32768`:
+
+| tok/s | BF16 head | FP8 head |
+|---|---|---|
+| k=2 MTP, single stream | 81.1 | **92.6** (+14.2%) |
+| k=2 MTP, aggregate at c=8 | 586.9 | **679.5** (+15.8%) |
+| speculation off, single stream | 53.0 | **55.4** (+4.5%) |
+| speculation off, aggregate at c=8 | 397.5 | **413.9** (+4.1%) |
+
+| | BF16 head | FP8 head |
+|---|---|---|
+| k=2 MTP acceptance | **56.4%** | 54.7% |
+| KV cache blocks | 1,406,182 | **1,441,034** (+2.5%) |
+
+A bytes-moved model accounts for both numbers. The non-head weights are 20.8
+GiB; the head is 2.37 GiB at BF16 and 1.18 GiB at FP8. One head pass per step
+predicts +5.5% (observed +4.5%), three passes predicts +14.8% (observed
++14.2%, and that is *after* the acceptance loss nets against it). The head is
+bandwidth, and MTP multiplies it.
+
+Acceptance does drop, because the draft logits come out of the same quantized
+head — but by 1.7 points, not enough to matter against a 14% step-time win.
+**Beware of attributing an acceptance gap to the head when the two
+checkpoints differ in more than the head.** An earlier comparison of this
+checkpoint against a third-party FP8-head build showed a 9-point acceptance
+gap and a net throughput *loss*; those two checkpoints also differed in every
+NVFP4 MLP tensor, and the controlled test above shows the head owns almost
+none of that. If you do want the per-step figure separated from acceptance,
+normalize with `spec_decode_acceptance_length` from `/metrics`.
+
+Fidelity costs a little, measured against the BF16 original on identical
+teacher-forced sequences, with the two checkpoints again differing in exactly
+one tensor:
+
+| | weight-only | emulated (W4A4) |
+|---|---|---|
+| KL, BF16 head | 0.01289 | 0.02511 |
+| KL, FP8 head | 0.01338 | 0.02589 |
+| paired difference | +0.0005 `[+.0003,+.0006]` | +0.0008 `[+.0006,+.0010]` |
+
+Small but real — worse on 29 of 30 prompts — and top-1 agreement does not
+move (96.12% -> 96.10%). That 4% relative KL increase and 1.7 points of
+acceptance buy 14% of decode throughput at k=2 and 1.2 GB of VRAM, so the
+flag is worth taking on any latency-sensitive deployment. Leave it off only
+when you are chasing the last of the fidelity — a leaderboard run, or a
+checkpoint whose whole point is being the closest one to BF16.
+
+Two things the flag refuses to do. It errors out on a model with
+`tie_word_embeddings`, where the head and the input embedding table are one
+tensor and quantizing the head would quantize the embeddings with it. And it
+errors out if `--ignore` still covers the head after the flag's own filter,
+rather than silently producing a BF16 head you asked to quantize.
+
+One implementation note worth knowing if you hand-edit a recipe: the head's
+group must be targeted by **regex**, not by exact module name. vLLM rewrites
+exact-name targets through the model's `hf_to_vllm_mapper` before matching
+them, and those mappers are prefix rules ending in a dot — Qwen3-VL maps
+`model.language_model.` to `language_model.model.`, which fixes up layer
+names, but its head rule is `lm_head.` and a bare `lm_head` target has no
+trailing dot to match. It survives unrewritten, fails to equal the real
+prefix `language_model.lm_head`, and vLLM builds an unquantized
+`ParallelLMHead` — which then dies at load with `no module or parameter named
+'lm_head.weight_scale'`. Regex targets are passed through that mapper
+untouched. `quantize.py` emits `re:.*lm_head$` for this reason.
+
 ### Per-layer embeddings (Gemma 4 E-series)
 
 The E-series carries a second embedding table, `embed_tokens_per_layer`, that
@@ -518,6 +607,7 @@ The original FP16 model is ~950 MB — roughly 2× smaller for W4A4.
 | `--max-len` | `1024` | Max tokens per calibration sample |
 | `--weight-only` | off | Use W4A16 instead of W4A4 |
 | `--fp8-deltanet` | off | Keep Gated DeltaNet projections at FP8 on hybrid models. See [FP8 DeltaNet](#fp8-deltanet-hybrid-linear-attention-models) |
+| `--fp8-lm-head` | off | Quantize the output head to FP8 and drop it from `--ignore`. See [FP8 output head](#fp8-output-head) |
 | `--fp8-mlp` | `off` | Keep the most quantization-sensitive MLP layers at FP8: `top:N` / `scan` (KL trials), `gptq-loss[:N]` (GPTQ proxy loss — use on Qwen-family hybrids), or an explicit layer list. See [Mixed-precision MLP](#mixed-precision-mlp) |
 | `--sensitivity-dataset` | `ultrachat` | Data the `--fp8-mlp` ranking is measured on. Defaults differently from `--dataset` deliberately — see [Mixed-precision MLP](#mixed-precision-mlp) |
 | `--sensitivity-samples` | `64` | Calibration samples behind the `--fp8-mlp` ranking (KL trials or Hessian accumulation) |
@@ -810,6 +900,20 @@ matches against those when reloading the checkpoint itself. No manual
 ```bash
 python -c "from pathlib import Path; from quantize import fix_ignore_list; fix_ignore_list(Path('./your-model-NVFP4'))"
 ```
+
+The mirror image of this failure exists too, with a nearly identical message
+but the *quantized* name missing instead:
+```
+ValueError: There is no module or parameter named 'lm_head.weight_scale' in
+<Model>ForCausalLM. The available parameters belonging to lm_head
+(ParallelLMHead) are: {'lm_head.weight'}
+```
+There the layer *was* quantized on disk, but a `config_groups` target failed to
+match vLLM's name for it, so vLLM built an unquantized layer that has nowhere
+to put the scale. vLLM rewrites exact-name targets through the model's
+`hf_to_vllm_mapper` before matching (`apply_vllm_mapper`) and passes `re:`
+targets through untouched, so a regex target is the robust form for anything
+outside the decoder stack. See [FP8 output head](#fp8-output-head).
 
 ### KV cache scales land on vision and audio towers
 Symptom at `vllm serve` time, on a multimodal checkpoint quantized with FP8 KV

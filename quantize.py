@@ -1481,6 +1481,33 @@ def fix_ignore_list(output_dir: Path, extra_ignore: list[str] | None = None) -> 
     )
 
 
+# Keys transformers 5.x records in the tokenizer's init_kwargs while *loading*
+# and then writes back out on save (tokenization_utils_base.py sets is_local /
+# local_files_only in _from_pretrained; backend comes from the load kwargs).
+# They describe the machine that ran the quantization, not the tokenizer, so
+# they have no business in a published checkpoint -- `is_local: true` in
+# particular is actively misleading to anyone reading the config. Harmless on
+# reload (they round-trip back into init_kwargs), so this is hygiene, not a fix.
+TOKENIZER_SAVE_STATE_KEYS = ("backend", "is_local", "local_files_only")
+
+
+def strip_tokenizer_save_state(output_dir: Path) -> None:
+    """Drop loader-state keys transformers leaks into tokenizer_config.json."""
+    config_path = output_dir / "tokenizer_config.json"
+    if not config_path.is_file():
+        return
+
+    config = json.loads(config_path.read_text())
+    dropped = [k for k in TOKENIZER_SAVE_STATE_KEYS if k in config]
+    if not dropped:
+        return
+
+    for key in dropped:
+        del config[key]
+    config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n")
+    print(f"Stripped loader state from tokenizer_config.json: {', '.join(dropped)}")
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
@@ -2271,6 +2298,7 @@ def main():
 
     preserve_dropped_tensors(model_id, Path(output_dir), model)
     fix_ignore_list(Path(output_dir), extra_ignore=args.ignore)
+    strip_tokenizer_save_state(Path(output_dir))
 
     size_mb = (
         sum(f.stat().st_size for f in Path(output_dir).rglob("*") if f.is_file())

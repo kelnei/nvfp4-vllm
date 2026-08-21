@@ -318,6 +318,51 @@ eight layers' worth of size. On gemma-class models keep `top:N`. The
 non-clean contexts stay available as diagnostics for the next architecture
 that disagrees with its scan.
 
+#### GPTQ and down_proj
+
+The proxy loss and the KL measurement can disagree in the other direction
+too. On Qwen3.8-27B, NVFP4-quantizing only the 64 `down_proj` of an otherwise
+BF16 model and scoring it on the release evaluation sequences measured GPTQ
+(full Hessian, ultrachat 64×2048) at 0.0076 weight-only KL against **0.0061
+for plain minmax rounding** — RTN better by 0.0015, on 27 of 30 prompts, both
+bootstrap CIs clear of zero. GPTQ was doing its job: on every layer checked
+it reached 2–5× lower Hessian-weighted loss than RTN, at 1.2–1.9× higher
+plain weight error, with clipping past the fixed group scales under 1% of
+weights. `down_proj` Hessians are pathologically concentrated — the diagonal's
+max/median ratio runs 130–11,700×, and on layer 63 sixty-four of 17,408 input
+channels carry half the energy — so GPTQ's compensation trades fidelity
+everywhere for a few massive-activation channels, and on response tokens that
+trade loses. The same measurement rescaled our Hessian to the per-channel
+variances in unsloth's published imatrix and moved KL by only 0.0004, which
+bounds what their private calibration corpus could be worth on these
+projections.
+
+That was an isolated ablation, not a checkpoint, and it did not transfer. The
+checkpoint-level A/B — the Qwen3.8-27B release recipe plus
+`--gptq-mlp-projections gate,up` (GPTQ on gate/up, plain minmax on down_proj),
+scored on the same release sequences against the shipped build — measured
+0.0132 vs 0.0129 weight-only KL (difference −0.0003, paired CIs
+[−0.0008, +0.0002] by token and [−0.0010, +0.0003] by prompt, 15/30 prompts
+either way: a tie) and 0.0268 vs 0.0251 with emulated W4A4 activations
+(−0.0017, both CIs clear of zero, the release better on 20 of 30 prompts). In
+the sequential pipeline GPTQ on `down_proj` sees the already-quantized gate/up
+activations and compensates their error; quantizing `down_proj` alone in a
+BF16 model gives it nothing to compensate and only the overfitting shows. The
+default `gate,up,down` stands; the flag is kept for the next architecture where
+the question comes up, not as a recommendation.
+
+The middle ground — `--gptq-mlp-damp down=0.1`, ten times llm-compressor's
+default Hessian dampening on `down_proj` only, which pulls GPTQ's solution
+part-way back toward plain rounding while keeping the compensation — measured
+0.0131 vs 0.0129 weight-only (−0.0002, CIs [−0.0006, +0.0002] both ways,
+14/30 prompts) and 0.0254 vs 0.0251 emulated (−0.0003, CIs [−0.0012, +0.0007]
+/ [−0.0011, +0.0007], 11/30): a tie in both modes, inside GPTQ's own
+build-to-build noise. Note that when projections carry different dampening the
+saved `recipe.yaml` only records the last `GPTQModifier` (llm-compressor keys
+modifiers by class name); both run, and the calibration log prints the
+per-projection values.
+The default stays `gate,up,down` until that A/B is measured.
+
 #### Why the scan uses a different corpus than calibration
 
 `--dataset` defaults to `mix` for coverage: activation scales and GPTQ should
@@ -608,6 +653,8 @@ The original FP16 model is ~950 MB — roughly 2× smaller for W4A4.
 | `--weight-only` | off | Use W4A16 instead of W4A4 |
 | `--fp8-deltanet` | off | Keep Gated DeltaNet projections at FP8 on hybrid models. See [FP8 DeltaNet](#fp8-deltanet-hybrid-linear-attention-models) |
 | `--fp8-lm-head` | off | Quantize the output head to FP8 and drop it from `--ignore`. See [FP8 output head](#fp8-output-head) |
+| `--gptq-mlp-projections` | `gate,up,down` | Subset of dense MLP projections the GPTQ modifier owns; the others stay plain minmax NVFP4. See [GPTQ and down_proj](#gptq-and-down_proj) |
+| `--gptq-mlp-damp` | `0.01` | GPTQ Hessian dampening, one value or `PROJ=FRAC` pairs (`down=0.1`); projections with different values run under their own `GPTQModifier`. See [GPTQ and down_proj](#gptq-and-down_proj) |
 | `--fp8-mlp` | `off` | Keep the most quantization-sensitive MLP layers at FP8: `top:N` / `scan` (KL trials), `gptq-loss[:N]` (GPTQ proxy loss — use on Qwen-family hybrids), or an explicit layer list. See [Mixed-precision MLP](#mixed-precision-mlp) |
 | `--sensitivity-dataset` | `ultrachat` | Data the `--fp8-mlp` ranking is measured on. Defaults differently from `--dataset` deliberately — see [Mixed-precision MLP](#mixed-precision-mlp) |
 | `--sensitivity-samples` | `64` | Calibration samples behind the `--fp8-mlp` ranking (KL trials or Hessian accumulation) |

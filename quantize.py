@@ -17,6 +17,7 @@ Usage:
                        [--samples N] [--max-len N] [--weight-only]
                        [--no-fp8-attn] [--fp8-deltanet] [--fp8-lm-head]
                        [--gptq-mlp {auto,on,off}]
+                       [--gptq-mlp-projections LIST] [--gptq-mlp-damp SPEC]
                        [--fp8-mlp SPEC] [--sensitivity-samples N]
                        [--sensitivity-report PATH]
                        [--sensitivity-context {clean,quantized}]
@@ -44,6 +45,12 @@ Defaults:
                  on-disk format, ~20% lower KL vs BF16 than plain minmax.
                  auto enables it for dense models and skips it for MoE,
                  --weight-only, and --no-fp8-attn runs)
+    gptq-mlp-projections = gate,up,down (which dense MLP projections the
+                 GPTQ modifier owns; the rest stay NVFP4 minmax. 'gate,up'
+                 is the A/B arm for the down_proj finding in GUIDE.md:
+                 down_proj Hessians are dominated by a handful of
+                 massive-activation channels and GPTQ's compensation
+                 measured worse than plain rounding there in isolation)
     fp8-mlp    = off (uniform NVFP4 across every dense MLP layer; 'top:N'
                  keeps the N most quantization-sensitive layers at FP8
                  instead, 'gptq-loss:N' ranks by GPTQ's own Hessian-weighted
@@ -1582,6 +1589,30 @@ def parse_args():
         "and a non-MoE model.",
     )
     p.add_argument(
+        "--gptq-mlp-damp",
+        default="0.01",
+        metavar="SPEC",
+        help="GPTQ Hessian dampening as a fraction of the mean diagonal: a "
+        "single value for every GPTQ-owned projection, or PROJ=FRAC pairs "
+        "(e.g. 'down=0.1') with unlisted projections at 0.01. Projections "
+        "that differ get their own GPTQModifier. Heavier dampening pulls "
+        "GPTQ's solution back toward plain rounding (default: 0.01, "
+        "llm-compressor's default).",
+    )
+    p.add_argument(
+        "--gptq-mlp-projections",
+        default="gate,up,down",
+        metavar="LIST",
+        help="Comma-separated subset of gate,up,down naming the dense MLP "
+        "projections --gptq-mlp hands to GPTQ; the others are quantized with "
+        "plain minmax NVFP4 in a group of their own (default: all three, the "
+        "recipe that shipped). 'gate,up' is the A/B arm for the down_proj "
+        "finding: isolated on Qwen3.8-27B, GPTQ's error compensation measured "
+        "0.0015 KL worse than plain rounding on down_proj, whose Hessians are "
+        "dominated by a few massive-activation channels. No effect with "
+        "--gptq-mlp off.",
+    )
+    p.add_argument(
         "--fp8-mlp",
         default="off",
         metavar="SPEC",
@@ -1766,6 +1797,38 @@ def main():
             )
     elif gptq_mlp == "auto" and (args.weight_only or not args.fp8_attn):
         gptq_mlp = "off"
+    gptq_projections = tuple(
+        part.strip() for part in args.gptq_mlp_projections.split(",") if part.strip()
+    )
+    bad = sorted(set(gptq_projections) - {"gate", "up", "down"})
+    if bad or not gptq_projections:
+        raise SystemExit(
+            f"--gptq-mlp-projections: expected a comma-separated subset of "
+            f"gate,up,down, got {args.gptq_mlp_projections!r}"
+            + (" (use --gptq-mlp off to disable GPTQ entirely)" if not bad else "")
+        )
+    gptq_projections = tuple(p for p in ("gate", "up", "down") if p in gptq_projections)
+    rtn_projections = tuple(p for p in ("gate", "up", "down") if p not in gptq_projections)
+    gptq_damp = {}
+    try:
+        for part in args.gptq_mlp_damp.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" in part:
+                proj, frac = part.split("=", 1)
+                if proj.strip() not in ("gate", "up", "down"):
+                    raise ValueError(proj)
+                gptq_damp[proj.strip()] = float(frac)
+            else:
+                for proj in ("gate", "up", "down"):
+                    gptq_damp.setdefault(proj, float(part))
+    except ValueError:
+        raise SystemExit(
+            f"--gptq-mlp-damp: expected FRAC or PROJ=FRAC pairs over gate,up,down, "
+            f"got {args.gptq_mlp_damp!r}"
+        )
+    gptq_damp = {p: gptq_damp.get(p, 0.01) for p in gptq_projections}
 
     # --fp8-mlp resolves to a mode now and to concrete module names once the
     # model (and, for the ranked modes, the calibration data) is loaded.
@@ -1824,6 +1887,8 @@ def main():
         mode += " + FP8 KV cache"
     if gptq_mlp == "on":
         mode += " + GPTQ MLP"
+        if rtn_projections:
+            mode += f" ({','.join(gptq_projections)})"
     if fp8_mlp_mode != "off":
         mode += f" + FP8 MLP fallback ({args.fp8_mlp})"
     if args.fp8_lm_head:
@@ -2194,14 +2259,53 @@ def main():
         # Without a promotion the regex stays, so an unpromoted run produces
         # exactly the config it always did.
         promoted_set = set(fp8_mlp_modules)
-        mlp_targets = (
-            [n for n in mlp_modules if n not in promoted_set]
-            if fp8_mlp_modules
-            else [GPTQ_MLP_TARGET]
-        )
-        mlp_scheme = preset_name_to_scheme(scheme, mlp_targets)
-        mlp_scheme.weights.observer = "imatrix_mse"
-        mlp_scheme.weights.actorder = "static"
+
+        def _projection_targets(projections: tuple[str, ...]) -> list[str]:
+            regex = rf"re:.*\.mlp\.({'|'.join(projections)})_proj$"
+            if not fp8_mlp_modules:
+                return [regex]
+            return [
+                n
+                for n in mlp_modules
+                if n not in promoted_set and match_name(n, regex)
+            ]
+
+        mlp_targets = _projection_targets(gptq_projections)
+        if rtn_projections:
+            # --gptq-mlp-projections left these out of GPTQ. With group_0
+            # gone nothing else claims them, so they get the plain minmax
+            # NVFP4 scheme group_0 would have given them, under their own
+            # targets so the two modifiers never overlap.
+            rtn_targets = _projection_targets(rtn_projections)
+            if rtn_targets:
+                config_groups["group_7"] = preset_name_to_scheme(scheme, rtn_targets)
+            print(
+                f"GPTQ MLP:    {', '.join(gptq_projections)} via GPTQ; "
+                f"{', '.join(rtn_projections)} plain minmax"
+            )
+        # One GPTQModifier per distinct dampening value (--gptq-mlp-damp);
+        # the default is a single modifier over every GPTQ-owned projection.
+        gptq_modifiers = []
+        for damp in sorted(set(gptq_damp.values())):
+            projections = tuple(p for p in gptq_projections if gptq_damp[p] == damp)
+            targets = _projection_targets(projections)
+            if not targets:
+                continue
+            group_scheme = preset_name_to_scheme(scheme, targets)
+            group_scheme.weights.observer = "imatrix_mse"
+            group_scheme.weights.actorder = "static"
+            gptq_modifiers.append(
+                GPTQModifier(
+                    config_groups={f"group_2_{len(gptq_modifiers)}" if gptq_modifiers else "group_2": group_scheme},
+                    ignore=args.ignore,
+                    dampening_frac=damp,
+                )
+            )
+        if len(gptq_modifiers) > 1:
+            print(
+                "GPTQ damp:   "
+                + ", ".join(f"{p}={gptq_damp[p]}" for p in gptq_projections)
+            )
         gather_recipe = None
         recipe = [
             QuantizationModifier(
@@ -2209,10 +2313,7 @@ def main():
                 ignore=args.ignore,
                 kv_cache_scheme=kv_cache_scheme,
             ),
-            GPTQModifier(
-                config_groups={"group_2": mlp_scheme},
-                ignore=args.ignore,
-            ),
+            *gptq_modifiers,
         ]
         if IMatrixGatherer is not None:
             # llm-compressor 0.12.0 only collects imatrix importance stats

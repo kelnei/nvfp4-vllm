@@ -5,10 +5,10 @@ description = "NVFP4 quantization and vLLM serving scripts"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "llmcompressor==0.12.0",
-    # llmcompressor 0.12.0 caps transformers at 5.10.1
-    "transformers==5.10.1",
-    "vllm==0.27.1",
+    "llmcompressor==0.13.0",
+    # llmcompressor 0.13.0 caps transformers at 5.14.1 (PyPI latest is 5.16.x)
+    "transformers==5.14.1",
+    "vllm==0.28.0",
     "datasets>=4.8.4",
 ]
 
@@ -22,15 +22,11 @@ fast-calib = [
 ]
 
 [tool.uv]
-# vllm 0.27.1 pins compressed-tensors==0.17.0 while llmcompressor 0.12.0
-# pins ==0.17.1; force the newer patch release so both can resolve.
-# vllm 0.27.1 also pins torch==2.13.0, above llmcompressor 0.12.0's <=2.12.0
-# cap; the cap is a conservative bound (0.13.0 allows 2.13.0 with the same
-# code paths), so override it rather than take llmcompressor 0.13.0's
-# compressed-tensors==0.18.0 minor-version jump.
+# vllm 0.28.0 pins compressed-tensors==0.17.0 while llmcompressor 0.13.0
+# pins ==0.18.0; force the newer release so both can resolve. Both agree on
+# torch==2.13.0 now, so the old torch override is gone.
 override-dependencies = [
-    "compressed-tensors==0.17.1",
-    "torch==2.13.0",
+    "compressed-tensors==0.18.0",
 ]
 # causal-conv1d's setup.py imports torch, so it cannot build in an isolated
 # environment.

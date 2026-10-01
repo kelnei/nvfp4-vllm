@@ -1094,10 +1094,12 @@ def rank_mlp_gptq_loss(
     one pass per chunk of `chunk_layers` layers to bound Hessian memory.
     --sensitivity-context does not apply here.
     """
-    from llmcompressor.modifiers.gptq.gptq_quantize import (
+    # llm-compressor 0.14 moved the Hessian helpers to gptq.helpers and made
+    # quantize_weight a batched, observer-free kernel.
+    from llmcompressor.modifiers.gptq.gptq_quantize import quantize_weight
+    from llmcompressor.modifiers.gptq.helpers import (
         accumulate_hessian,
         make_empty_hessian,
-        quantize_weight,
     )
     from llmcompressor.modifiers.quantization.calibration import initialize_observer
 
@@ -1170,18 +1172,26 @@ def rank_mlp_gptq_loss(
             for label, scheme in (("nvfp4", nvfp4_scheme), ("fp8", fp8_scheme)):
                 module.quantization_scheme = scheme
                 initialize_observer(module, "weight")
-                module.weight_observer(module.weight)
-                # quantize_weight consumes the Hessian in place; clone for
-                # the first format so the second sees the real one.
-                h = hessian.clone() if label == "nvfp4" else hessian
-                loss, _ = quantize_weight(
-                    module=module,
+                qparams = module.weight_observer(module.weight).get_qparams()
+                global_scale = qparams.get("global_scale")
+                # quantize_weight takes [batch, ...] stacks and uses them as
+                # working buffers; clone so the second format sees the real
+                # Hessian and the module weight is never touched.
+                _, batch_losses, _ = quantize_weight(
+                    weights=module.weight.detach().unsqueeze(0).clone(),
+                    hessians=hessian.unsqueeze(0).clone(),
+                    scale=qparams["scale"].unsqueeze(0),
+                    zero_point=qparams["zero_point"].unsqueeze(0),
+                    global_scale=(
+                        None
+                        if global_scale is None
+                        else global_scale.reshape(-1)[:1]
+                    ),
                     quant_args=scheme.weights,
-                    hessian=h,
                     blocksize=128,
                     percdamp=0.01,
                 )
-                entry[label] = loss
+                entry[label] = batch_losses[0].item()
                 del module.weight_observer
                 del module.quantization_scheme
             losses[name] = entry

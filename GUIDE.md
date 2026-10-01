@@ -3,7 +3,7 @@
 End-to-end walkthrough: quantize a model to NVFP4 and serve it with vLLM.
 
 **Hardware used:** NVIDIA RTX PRO 6000 Blackwell Workstation (SM 12.0, 96 GB VRAM)
-**Confirmed working:** vLLM 0.27.1, torch 2.13.0+cu130, llmcompressor 0.12.0
+**Confirmed working:** vLLM 0.30.0, torch 2.13.0+cu130, llmcompressor 0.14.0
 
 ---
 
@@ -59,11 +59,10 @@ sudo apt-get install -y python3.12-dev gcc
 ### Python environment
 
 Dependencies are managed via `pyproject.toml` with exact pins for the core stack
-(vLLM 0.27.1, llmcompressor 0.12.0, transformers 5.10.1). Two quirks: vLLM 0.27.1
-pins `compressed-tensors==0.17.0` while llmcompressor 0.12.0 pins `==0.17.1`, and
-vLLM's `torch==2.13.0` sits above llmcompressor's conservative `<=2.12.0` cap, so
-the `[tool.uv]` section uses `override-dependencies` for both — without it the
-packages cannot resolve together.
+(vLLM 0.30.0, llmcompressor 0.14.0, transformers 5.17.0 — llmcompressor's cap).
+One quirk: vLLM 0.30.0 pins `compressed-tensors==0.17.0` while llmcompressor
+0.14.0 pins `==0.19.0`, so the `[tool.uv]` section forces the newer release with
+`override-dependencies` — without it the packages cannot resolve together.
 
 For hybrid linear-attention models (Qwen3.5/3.6/3.8), the optional
 `fast-calib` extra installs `flash-linear-attention` and `causal-conv1d` so
@@ -85,7 +84,7 @@ python -c "import vllm; print(vllm.__version__)"
 Expected output:
 ```
 2.13.0+cu130 True
-0.27.1
+0.30.0
 ```
 
 ---
@@ -736,7 +735,7 @@ cache blocks pre-allocated to avoid fragmentation at runtime. Use
 | `--enable-auto-tool-choice` | off | Let the model decide when to use tools |
 
 Any flag not listed above is passed through to vLLM unchanged, so every
-`vllm serve` option is available (e.g. `--swap-space 8`).
+`vllm serve` option is available (e.g. `--max-num-batched-tokens 8192`).
 
 ### Chat interactively
 

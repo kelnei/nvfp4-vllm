@@ -111,7 +111,7 @@ harmless). Exits non-zero on findings.
 | `--enable-auto-tool-choice` | off | Let the model decide when to use tools |
 
 Any flag not listed above is passed through to vLLM unchanged, so every
-`vllm serve` option is available (e.g. `--swap-space 8`).
+`vllm serve` option is available (e.g. `--max-num-batched-tokens 8192`).
 
 ### chat.py
 

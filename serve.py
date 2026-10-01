@@ -14,7 +14,7 @@ Defaults:
 
 Any flag this script does not define is passed through to vLLM unchanged,
 so all `vllm serve` options are available, e.g.:
-    python serve.py --model ./my-model --swap-space 8 --disable-log-requests
+    python serve.py --model ./my-model --max-num-batched-tokens 8192 --enable-log-requests
 """
 
 import argparse
@@ -274,8 +274,10 @@ def main():
     cmd = [
         sys.executable,
         "-m",
-        "vllm.entrypoints.openai.api_server",
-        "--model",
+        # `vllm serve`, run under this interpreter; vLLM 0.30 deprecated
+        # the old vllm.entrypoints.openai.api_server module entry point.
+        "vllm.entrypoints.cli.main",
+        "serve",
         args.model,
         "--host",
         args.host,
